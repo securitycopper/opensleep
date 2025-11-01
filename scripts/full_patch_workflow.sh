@@ -1,0 +1,520 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "======================================"
+echo "OpenSleep Image Patching Script"
+echo "======================================"
+echo ""
+echo "Note: This script requires sudo privileges for:"
+echo "  - Mounting disk images (losetup, mount)"
+echo "  - Extracting and modifying system files"
+echo "  - Setting proper file ownership and permissions"
+echo ""
+
+# Default values
+IMG_FILE=""
+PUBKEY_FILE=""
+SSID=""
+PSK=""
+PASSWORD=""
+DISABLE_SERVICES=false
+OPENSLEEP_BINARY=""
+OPENSLEEP_SERVICE=""
+OPENSLEEP_CONFIG=""
+OUTPUT_FILE=""
+WORK_DIR_CUSTOM=""
+
+# Parse command-line arguments
+usage() {
+    cat <<EOF
+Usage: $0 -i IMAGE_FILE -k PUBKEY_FILE [-o OUTPUT_FILE] [-w WORK_DIR] [-s SSID] [-p PSK] [-P PASSWORD] [-d] [-b BINARY] [-S SERVICE] [-c CONFIG]
+
+Required arguments:
+  -i IMAGE_FILE    Path to the SD card image file
+  -k PUBKEY_FILE   Path to the SSH public key file
+
+Optional arguments:
+  -o OUTPUT_FILE   Path for the patched output image (default: <original>-patched.img)
+  -w WORK_DIR      Custom working directory (must be empty, needs 16GB free space)
+  -s SSID          WiFi network SSID
+  -p PSK           WiFi network password/passphrase
+  -P PASSWORD      Password for the rewt user
+  -d               Disable Eight Sleep services on first boot
+                   WARNING: This prevents normal Eight Sleep app pairing.
+                   To restore Eight Sleep functionality, you must reflash the original image.
+  -b BINARY        Path to opensleep binary to install
+  -S SERVICE       Path to opensleep.service file to install
+  -c CONFIG        Path to config.ron file to install
+  -h               Show this help message
+
+Example:
+  $0 -i sdcard.img -k ~/.ssh/id_rsa.pub -s "MyWiFi" -p "password123" -P "userpass" -d
+  $0 -i sdcard.img -o sdcard-patched.img -w /mnt/bigdrive/temp -k ~/.ssh/id_rsa.pub -s "MyWiFi" -p "pass" -b ./opensleep -S ./opensleep.service -c ./config.ron -d
+EOF
+    exit 1
+}
+
+while getopts "i:k:o:w:s:p:P:b:S:c:dh" opt; do
+    case $opt in
+        i) IMG_FILE="$OPTARG" ;;
+        k) PUBKEY_FILE="$OPTARG" ;;
+        o) OUTPUT_FILE="$OPTARG" ;;
+        w) WORK_DIR_CUSTOM="$OPTARG" ;;
+        s) SSID="$OPTARG" ;;
+        p) PSK="$OPTARG" ;;
+        P) PASSWORD="$OPTARG" ;;
+        b) OPENSLEEP_BINARY="$OPTARG" ;;
+        S) OPENSLEEP_SERVICE="$OPTARG" ;;
+        c) OPENSLEEP_CONFIG="$OPTARG" ;;
+        d) DISABLE_SERVICES=true ;;
+        h) usage ;;
+        *) usage ;;
+    esac
+done
+
+# Validate required arguments
+if [[ -z "$IMG_FILE" ]] || [[ -z "$PUBKEY_FILE" ]]; then
+    echo ""
+    echo "Error: Missing required arguments"
+    echo ""
+    usage
+fi
+
+echo "[*] Validating input files..."
+
+# Validate files exist
+if [[ ! -f "$IMG_FILE" ]]; then
+    echo "Error: Image file not found: $IMG_FILE"
+    exit 1
+fi
+echo "  ✓ Image file found: $IMG_FILE"
+
+if [[ ! -f "$PUBKEY_FILE" ]]; then
+    echo "Error: Public key file not found: $PUBKEY_FILE"
+    exit 1
+fi
+echo "  ✓ Public key file found: $PUBKEY_FILE"
+
+# Validate opensleep files if provided
+if [[ ! -z "$OPENSLEEP_BINARY" ]] && [[ ! -f "$OPENSLEEP_BINARY" ]]; then
+    echo "Error: opensleep binary not found: $OPENSLEEP_BINARY"
+    exit 1
+fi
+
+if [[ ! -z "$OPENSLEEP_SERVICE" ]] && [[ ! -f "$OPENSLEEP_SERVICE" ]]; then
+    echo "Error: opensleep.service file not found: $OPENSLEEP_SERVICE"
+    exit 1
+fi
+
+if [[ ! -z "$OPENSLEEP_CONFIG" ]] && [[ ! -f "$OPENSLEEP_CONFIG" ]]; then
+    echo "Error: config.ron file not found: $OPENSLEEP_CONFIG"
+    exit 1
+fi
+
+if [[ ! -z "$OPENSLEEP_BINARY" ]]; then
+    echo "  ✓ opensleep binary found: $OPENSLEEP_BINARY"
+    echo "  ✓ opensleep.service found: $OPENSLEEP_SERVICE"
+    echo "  ✓ config.ron found: $OPENSLEEP_CONFIG"
+fi
+
+echo ""
+
+# Check if all three opensleep files are provided together
+OPENSLEEP_COUNT=0
+[[ ! -z "$OPENSLEEP_BINARY" ]] && ((OPENSLEEP_COUNT++)) || true
+[[ ! -z "$OPENSLEEP_SERVICE" ]] && ((OPENSLEEP_COUNT++)) || true
+[[ ! -z "$OPENSLEEP_CONFIG" ]] && ((OPENSLEEP_COUNT++)) || true
+
+if [[ $OPENSLEEP_COUNT -gt 0 ]] && [[ $OPENSLEEP_COUNT -lt 3 ]]; then
+    echo "Error: All three opensleep files must be provided together (-b, -S, -c)"
+    exit 1
+fi
+
+echo "[*] Setting up output path..."
+
+# Set default output file if not provided
+if [[ -z "$OUTPUT_FILE" ]]; then
+    # Get the absolute path of the input image
+    IMG_ABSOLUTE=$(realpath "$IMG_FILE")
+    IMG_DIR=$(dirname "$IMG_ABSOLUTE")
+    IMG_NAME=$(basename "$IMG_ABSOLUTE")
+    
+    # Remove extension and add -patched
+    IMG_BASE="${IMG_NAME%.*}"
+    IMG_EXT="${IMG_NAME##*.}"
+    
+    # Create output path in same directory as input
+    OUTPUT_FILE="${IMG_DIR}/${IMG_BASE}-patched.${IMG_EXT}"
+fi
+
+echo "  ✓ Output will be: $OUTPUT_FILE"
+
+# Check if output file already exists
+if [[ -f "$OUTPUT_FILE" ]]; then
+    echo "Error: Output file already exists: $OUTPUT_FILE"
+    echo "Please remove it or specify a different output path with -o"
+    exit 1
+fi
+
+echo ""
+echo "[*] Creating working directory..."
+
+# Handle custom or temporary working directory
+if [[ ! -z "$WORK_DIR_CUSTOM" ]]; then
+    # Validate custom working directory
+    if [[ ! -d "$WORK_DIR_CUSTOM" ]]; then
+        echo "Error: Custom working directory does not exist: $WORK_DIR_CUSTOM"
+        exit 1
+    fi
+    
+    # Check if directory is empty
+    if [[ -n "$(ls -A "$WORK_DIR_CUSTOM" 2>/dev/null)" ]]; then
+        echo "Error: Custom working directory is not empty: $WORK_DIR_CUSTOM"
+        echo "Please provide an empty directory"
+        exit 1
+    fi
+    
+    WORK_DIR="$WORK_DIR_CUSTOM"
+    echo "  ✓ Using custom working directory: $WORK_DIR"
+else
+    WORK_DIR=$(mktemp -d -t work_$(basename "$IMG_FILE").XXXX)
+    echo "  ✓ Created temporary working directory: $WORK_DIR"
+fi
+
+# Check available space (need at least 16GB)
+REQUIRED_SPACE_GB=16
+REQUIRED_SPACE_KB=$((REQUIRED_SPACE_GB * 1024 * 1024))
+AVAILABLE_SPACE_KB=$(df -k "$WORK_DIR" | tail -1 | awk '{print $4}')
+AVAILABLE_SPACE_GB=$((AVAILABLE_SPACE_KB / 1024 / 1024))
+
+echo "[*] Checking available disk space..."
+echo "  Available: ${AVAILABLE_SPACE_GB}GB"
+echo "  Required:  ${REQUIRED_SPACE_GB}GB"
+
+if [[ $AVAILABLE_SPACE_KB -lt $REQUIRED_SPACE_KB ]]; then
+    echo "Error: Insufficient disk space in working directory"
+    echo "  Location: $WORK_DIR"
+    echo "  Available: ${AVAILABLE_SPACE_GB}GB"
+    echo "  Required: ${REQUIRED_SPACE_GB}GB"
+    echo "Please free up space or use -w to specify a different working directory"
+    exit 1
+fi
+
+echo "  ✓ Sufficient space available"
+
+WORKING_IMG="$WORK_DIR/working_image.img"
+EXTRACT_DIR="$WORK_DIR/rootfs_extract"
+MOUNT_DIR="$WORK_DIR/mount"
+
+echo "[*] Original image: $IMG_FILE"
+echo "[*] Output will be saved to: $OUTPUT_FILE"
+
+# --- Copy the original image ---
+echo "[*] Copying original image to working directory..."
+cp "$IMG_FILE" "$WORKING_IMG"
+echo "[+] Image copied successfully"
+
+# --- Cleanup function ---
+cleanup() {
+    local exit_code=$?
+    echo "[*] Cleaning up..."
+    
+    # Unmount if mounted
+    if mountpoint -q "$MOUNT_DIR" 2>/dev/null; then
+        echo "[*] Unmounting $MOUNT_DIR..."
+        sudo umount "$MOUNT_DIR" 2>/dev/null || true
+    fi
+    
+    # Detach loop device if attached
+    if [[ ! -z "$LOOP" ]] && losetup "$LOOP" 2>/dev/null; then
+        echo "[*] Detaching loop device $LOOP..."
+        sudo losetup -d "$LOOP" 2>/dev/null || true
+    fi
+    
+    # Remove working directory
+    if [[ -d "$WORK_DIR" ]]; then
+        echo "[*] Removing work directory..."
+        rm -rf "$WORK_DIR" 2>/dev/null || true
+    fi
+    
+    if [[ $exit_code -ne 0 ]]; then
+        echo "[-] Script failed with exit code $exit_code"
+    fi
+    
+    exit $exit_code
+}
+
+# Set trap to call cleanup on exit, interrupt, or termination
+trap cleanup EXIT INT TERM
+
+# --- Check if extraction directory already exists with contents ---
+if [[ -d "$EXTRACT_DIR" ]] && [[ -n "$(ls -A "$EXTRACT_DIR" 2>/dev/null)" ]]; then
+    echo "[-] Error: Extraction directory already exists with contents: $EXTRACT_DIR"
+    echo "[-] This may indicate a previous run was interrupted or there's a conflict."
+    echo "[-] Please remove the directory manually if you're sure it's safe to do so:"
+    echo "[-]   rm -rf \"$EXTRACT_DIR\""
+    exit 1
+fi
+
+# --- Setup loop device ---
+LOOP=$(sudo losetup -Pf --show "$WORKING_IMG")
+echo "[*] Loop device: $LOOP"
+
+# --- Mount root partition ---
+ROOT_PART="${LOOP}p1"
+mkdir -p "$MOUNT_DIR"
+sudo mount "$ROOT_PART" "$MOUNT_DIR"
+echo "[*] Mounted root partition at $ROOT_PART"
+
+# --- Extract rootfs.tar.gz ---
+ROOTFS_TAR_GZ=$(sudo find "$MOUNT_DIR" -name "rootfs.tar.gz" 2>/dev/null | head -n1)
+if [[ -z "$ROOTFS_TAR_GZ" ]]; then
+    echo "[-] rootfs.tar.gz not found!"
+    exit 1
+fi
+mkdir -p "$EXTRACT_DIR"
+echo "[*] Extracting $ROOTFS_TAR_GZ..."
+sudo tar -xzf "$ROOTFS_TAR_GZ" -C "$EXTRACT_DIR"
+
+# --- Detect rewt UID/GID ---
+REWT_HOME="$EXTRACT_DIR/home/rewt"
+REWT_UID=$(sudo stat -c "%u" "$REWT_HOME")
+REWT_GID=$(sudo stat -c "%g" "$REWT_HOME")
+echo "[+] rewt detected at $REWT_HOME, UID=$REWT_UID GID=$REWT_GID"
+
+# --- Comment out original keys ---
+# Section commented out, supect it caused issues with the app crashing if it partially pairs
+AK_FILE="$EXTRACT_DIR/etc/ssh/authorized_keys"
+#if [[ -f "$AK_FILE" ]]; then
+#    echo "[*] Commenting out original keys..."
+#    sudo sed -i 's/^/##/' "$AK_FILE"
+#fi
+
+# --- Append new public key ---
+echo "[*] Appending new public key..."
+sudo bash -c "cat '$PUBKEY_FILE' >> '$AK_FILE'"
+sudo chmod 600 "$AK_FILE"
+sudo chown "$REWT_UID:$REWT_GID" "$AK_FILE"
+
+# --- Set password if provided ---
+if [[ ! -z "$PASSWORD" ]]; then
+    echo "[*] Setting password for rewt..."
+    HASH=$(openssl passwd -6 "$PASSWORD")
+    sudo sed -i "s|^rewt:[^:]*:|rewt:$HASH:|" "$EXTRACT_DIR/etc/shadow"
+    # Enable PasswordAuthentication
+    sudo sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' "$EXTRACT_DIR/etc/ssh/sshd_config"
+fi
+
+# --- Create NetworkManager connection ---
+if [[ ! -z "$SSID" && ! -z "$PSK" ]]; then
+    NM_DIR="$EXTRACT_DIR/etc/NetworkManager/system-connections"
+    sudo mkdir -p "$NM_DIR"
+    NM_FILE="$NM_DIR/$SSID.nmconnection"
+    echo "[*] Creating NetworkManager connection..."
+    
+    # Generate UUID for the connection
+    UUID=$(uuidgen || cat /proc/sys/kernel/random/uuid)
+    
+    sudo bash -c "cat > '$NM_FILE'" <<EOF
+[connection]
+id=$SSID
+uuid=$UUID
+type=wifi
+autoconnect=true
+autoconnect-priority=100
+
+[wifi]
+mode=infrastructure
+ssid=$SSID
+
+[wifi-security]
+auth-alg=open
+key-mgmt=wpa-psk
+psk=$PSK
+
+[ipv4]
+method=auto
+
+[ipv6]
+addr-gen-mode=stable-privacy
+method=auto
+EOF
+    sudo chmod 600 "$NM_FILE"
+    sudo chown "$REWT_UID:$REWT_GID" "$NM_FILE"
+    echo "[+] Created WiFi connection: $SSID"
+fi
+
+# --- Enable SSH + Network Early Service ---
+echo "[*] Installing ssh-early.service..."
+
+SSH_EARLY_SERVICE="$EXTRACT_DIR/etc/systemd/system/ssh-early.service"
+
+if [[ ! -z "$SSID" ]]; then
+    # If WiFi is configured, wait for it
+    sudo bash -c "cat > '$SSH_EARLY_SERVICE'" <<EOF
+[Unit]
+Description=Force-enable SSH and Wi-Fi early in boot
+After=network-pre.target NetworkManager.service
+Before=capybara.service variscite-bt.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 5
+ExecStartPre=/usr/bin/nmcli radio wifi on
+ExecStartPre=/usr/bin/nmcli connection up "$SSID" || true
+ExecStartPre=/bin/sleep 3
+ExecStart=/bin/systemctl start sshd.socket
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+else
+    # No WiFi configured, just start SSH
+    sudo bash -c "cat > '$SSH_EARLY_SERVICE'" <<EOF
+[Unit]
+Description=Force-enable SSH early in boot
+After=network-pre.target
+Before=capybara.service variscite-bt.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl start sshd.socket
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+fi
+
+sudo chmod 644 "$SSH_EARLY_SERVICE"
+sudo mkdir -p "$EXTRACT_DIR/etc/systemd/system/multi-user.target.wants"
+sudo ln -sf ../ssh-early.service "$EXTRACT_DIR/etc/systemd/system/multi-user.target.wants/ssh-early.service"
+
+echo "[+] SSH early service installed and enabled."
+
+# --- Create service to disable Eight Sleep services ---
+if [[ "$DISABLE_SERVICES" = true ]]; then
+    echo ""
+    echo "⚠️  WARNING: Disabling Eight Sleep services ⚠️"
+    echo "This will prevent the Eight Sleep app from pairing with the Pod."
+    echo "To restore normal Eight Sleep functionality, you must reflash the original image."
+    echo ""
+    
+    echo "[*] Installing disable-eightsleep-services.service..."
+
+    DISABLE_SERVICE="$EXTRACT_DIR/etc/systemd/system/disable-eightsleep-services.service"
+    sudo bash -c "cat > '$DISABLE_SERVICE'" <<EOF
+[Unit]
+Description=Disable Eight Sleep services on first boot
+After=multi-user.target
+ConditionPathExists=!/var/lib/eightsleep-disabled.flag
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl disable --now dac frank capybara swupdate-progress swupdate defibrillator
+ExecStartPost=/bin/touch /var/lib/eightsleep-disabled.flag
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    sudo chmod 644 "$DISABLE_SERVICE"
+    sudo ln -sf ../disable-eightsleep-services.service "$EXTRACT_DIR/etc/systemd/system/multi-user.target.wants/disable-eightsleep-services.service"
+
+    echo "[+] Service to disable Eight Sleep services installed."
+fi
+
+# --- Install opensleep if provided ---
+if [[ ! -z "$OPENSLEEP_BINARY" ]]; then
+    echo "[*] Installing opensleep..."
+    
+    # Create /opt/opensleep directory
+    OPENSLEEP_DIR="$EXTRACT_DIR/opt/opensleep"
+    sudo mkdir -p "$OPENSLEEP_DIR"
+    
+    # Copy binary
+    echo "[*] Copying opensleep binary..."
+    sudo cp "$OPENSLEEP_BINARY" "$OPENSLEEP_DIR/opensleep"
+    sudo chmod 755 "$OPENSLEEP_DIR/opensleep"
+    sudo chown "$REWT_UID:$REWT_GID" "$OPENSLEEP_DIR/opensleep"
+    
+    # Copy config
+    echo "[*] Copying config.ron..."
+    sudo cp "$OPENSLEEP_CONFIG" "$OPENSLEEP_DIR/config.ron"
+    sudo chmod 644 "$OPENSLEEP_DIR/config.ron"
+    sudo chown "$REWT_UID:$REWT_GID" "$OPENSLEEP_DIR/config.ron"
+    
+    # Install service file
+    echo "[*] Installing opensleep.service..."
+    SYSTEMD_DIR="$EXTRACT_DIR/lib/systemd/system"
+    sudo mkdir -p "$SYSTEMD_DIR"
+    sudo cp "$OPENSLEEP_SERVICE" "$SYSTEMD_DIR/opensleep.service"
+    sudo chmod 644 "$SYSTEMD_DIR/opensleep.service"
+    
+    # Enable the service
+    echo "[*] Enabling opensleep service..."
+    sudo mkdir -p "$EXTRACT_DIR/etc/systemd/system/multi-user.target.wants"
+    sudo ln -sf /lib/systemd/system/opensleep.service "$EXTRACT_DIR/etc/systemd/system/multi-user.target.wants/opensleep.service"
+    
+    echo "[+] opensleep installed and enabled."
+    
+    # Automatically enable service disabling if opensleep is installed
+    if [[ "$DISABLE_SERVICES" = false ]]; then
+        echo "[*] Note: Consider using -d flag to disable Eight Sleep services when using opensleep"
+    fi
+fi
+
+# --- Repack rootfs.tar.gz ---
+echo "[*] Repacking rootfs.tar.gz..."
+sudo tar -C "$EXTRACT_DIR" -czf "$WORK_DIR/rootfs-patched.tar.gz" .
+
+# --- Update rootfs.tar.gz in mounted image ---
+echo "[*] Updating rootfs.tar.gz in image..."
+sudo cp "$WORK_DIR/rootfs-patched.tar.gz" "$ROOTFS_TAR_GZ"
+
+# --- Verify files ---
+echo ""
+echo "[*] Verifying patched files..."
+if sudo test -f "$AK_FILE"; then
+    echo "  ✓ SSH authorized_keys file created"
+else
+    echo "  ✗ Warning: Could not verify authorized_keys"
+fi
+
+if sudo grep -q "PasswordAuthentication" "$EXTRACT_DIR/etc/ssh/sshd_config" 2>/dev/null; then
+    echo "  ✓ SSH configuration updated"
+fi
+
+if [[ ! -z "$SSID" ]] && sudo test -f "$NM_FILE"; then
+    echo "  ✓ WiFi connection configured: $SSID"
+fi
+
+if [[ ! -z "$OPENSLEEP_BINARY" ]]; then
+    if sudo test -f "$OPENSLEEP_DIR/opensleep"; then
+        echo "  ✓ opensleep binary installed"
+    fi
+    if sudo test -f "$OPENSLEEP_DIR/config.ron"; then
+        echo "  ✓ opensleep config.ron installed"
+    fi
+    if sudo test -f "$SYSTEMD_DIR/opensleep.service"; then
+        echo "  ✓ opensleep.service installed"
+    fi
+fi
+
+ROOTFS_SIZE=$(sudo stat -c%s "$ROOTFS_TAR_GZ")
+ROOTFS_SIZE_MB=$((ROOTFS_SIZE / 1024 / 1024))
+echo "  ✓ Repacked rootfs.tar.gz: ${ROOTFS_SIZE_MB}MB"
+
+echo ""
+# --- Move patched image to output location ---
+echo "[*] Moving patched image to output location..."
+sudo mv "$WORKING_IMG" "$OUTPUT_FILE"
+sudo chown $(id -u):$(id -g) "$OUTPUT_FILE"
+echo "[+] Patched image saved to: $OUTPUT_FILE"
+echo ""
+echo "[+] Patch workflow complete!"
+echo "[*] Flash patched SD card image and perform factory reset to apply changes."
+echo "[*] Original image preserved at: $IMG_FILE"
