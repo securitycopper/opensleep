@@ -4,28 +4,7 @@ This document tracks potential improvements and features for the Pod 3 patching 
 
 ## Priority: Medium
 
-### 1. NTP Time Synchronization
-**Status:** Planned  
-**Description:** Configure NTP (Network Time Protocol) for accurate system time  
-**Problem:** Currently the system clock shows incorrect time (e.g., "Wed 2021-03-24" when actual date is "Sun 2025-11-02")  
-**Solution Ideas:**
-- Add systemd-timesyncd configuration
-- Configure NTP server (e.g., pool.ntp.org, time.google.com)
-- Ensure service starts after network is online
-- Consider adding `-t` flag to patching script for custom NTP server
-
-**Implementation Notes:**
-```bash
-# Example systemd-timesyncd configuration
-# File: /etc/systemd/timesyncd.conf
-[Time]
-NTP=time.google.com pool.ntp.org
-FallbackNTP=time.cloudflare.com
-```
-
----
-
-### 2. SSH Key Cleanup
+### 1. SSH Key Cleanup
 **Status:** Planned  
 **Description:** Remove/disable Eight Sleep's SSH keys for improved security  
 **Current Behavior:** Eight Sleep's authorized keys may still exist on the system  
@@ -41,7 +20,7 @@ FallbackNTP=time.cloudflare.com
 
 ---
 
-### 3. Static IP Address Configuration
+### 2. Static IP Address Configuration
 **Status:** Planned  
 **Description:** Option to set static IP address instead of DHCP  
 **Use Case:** Easier to find Pod on network, stable IP for automation  
@@ -68,7 +47,7 @@ dns=8.8.8.8;8.8.4.4;
 
 ## Priority: Low
 
-### 4. On-Device opensleep Compilation
+### 3. On-Device opensleep Compilation
 **Status:** Research Needed  
 **Description:** Build opensleep binary directly on the Pod 3 device  
 **Current Workflow:** Cross-compile on development machine, copy to Pod  
@@ -113,6 +92,13 @@ free -h
 ---
 
 ## Completed Tasks
+
+✅ **NTP Time Synchronization** - Already working via systemd-timesyncd (November 2, 2025)
+  - System uses systemd-timesyncd service (enabled and active)
+  - Syncing with local router NTP server (192.168.2.1:123)
+  - System clock synchronized correctly
+  - opensleep uses timezone from config.ron (America/New_York) for scheduling
+  - No additional configuration needed
 
 ✅ **MAC Address Persistence** - Implemented and tested (November 2, 2025)  
 ✅ **WiFi Auto-Connect** - Implemented and tested  
