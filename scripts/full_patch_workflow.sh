@@ -496,7 +496,29 @@ EOF
     sudo cp "$WPA_CONF" "$MOUNT_DIR/etc/wpa_supplicant/"
     sudo cp "$NETWORKD_CONF" "$MOUNT_DIR/etc/systemd/network/"
     
+    # Disable NetworkManager MAC randomization for wlan0
+    NM_CONF_DIR="$STAGING_DIR/etc/NetworkManager/conf.d"
+    sudo mkdir -p "$NM_CONF_DIR"
+    NM_CONF="$NM_CONF_DIR/99-disable-wifi-mac-randomization.conf"
+    sudo bash -c "cat > '$NM_CONF'" <<EOF
+[device-mac-randomization]
+# Disable MAC randomization for WiFi
+wifi.scan-rand-mac-address=no
+
+[connection-mac-randomization]
+# Use permanent MAC address
+ethernet.cloned-mac-address=permanent
+wifi.cloned-mac-address=permanent
+EOF
+    sudo chmod 644 "$NM_CONF"
+    sudo chown 0:0 "$NM_CONF"
+    
+    # Also write to mounted partition
+    sudo mkdir -p "$MOUNT_DIR/etc/NetworkManager/conf.d"
+    sudo cp "$NM_CONF" "$MOUNT_DIR/etc/NetworkManager/conf.d/"
+    
     echo "[+] Created WiFi configuration for SSID: $SSID"
+    echo "    ✓ NetworkManager MAC randomization disabled"
 fi
 
 # --- WiFi initialization service (must be created before MAC service can reference it) ---
