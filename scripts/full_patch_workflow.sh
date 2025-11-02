@@ -272,26 +272,49 @@ if [[ -z "$ROOTFS_TAR_GZ" ]]; then
     echo "[-] rootfs.tar.gz not found!"
     exit 1
 fi
-mkdir -p "$EXTRACT_DIR"
+
+# Ungzip the rootfs.tar.gz
 echo "[*] Extracting $ROOTFS_TAR_GZ..."
-sudo tar -xzf "$ROOTFS_TAR_GZ" -C "$EXTRACT_DIR"
+ROOTFS_TAR="$WORK_DIR/rootfs.tar"
+sudo gunzip -c "$ROOTFS_TAR_GZ" > "$ROOTFS_TAR"
+
+# Extract only what we need to modify
+mkdir -p "$EXTRACT_DIR"
+sudo tar -xf "$ROOTFS_TAR" -C "$EXTRACT_DIR" ./etc/ssh/authorized_keys ./home/rewt ./etc/shadow 2>/dev/null || true
 
 # --- Detect rewt UID/GID ---
 REWT_HOME="$EXTRACT_DIR/home/rewt"
-REWT_UID=$(sudo stat -c "%u" "$REWT_HOME")
-REWT_GID=$(sudo stat -c "%g" "$REWT_HOME")
-echo "[+] rewt detected at $REWT_HOME, UID=$REWT_UID GID=$REWT_GID"
+if [[ -d "$REWT_HOME" ]]; then
+    REWT_UID=$(sudo stat -c "%u" "$REWT_HOME")
+    REWT_GID=$(sudo stat -c "%g" "$REWT_HOME")
+    echo "[+] rewt detected, UID=$REWT_UID GID=$REWT_GID"
+else
+    # Default to common embedded Linux UID/GID
+    REWT_UID=1001
+    REWT_GID=1001
+    echo "[+] Using default UID=$REWT_UID GID=$REWT_GID"
+fi
 
-# --- Comment out original keys ---
-# Section commented out, supect it caused issues with the app crashing if it partially pairs
-AK_FILE="$EXTRACT_DIR/etc/ssh/authorized_keys"
-#if [[ -f "$AK_FILE" ]]; then
-#    echo "[*] Commenting out original keys..."
-#    sudo sed -i 's/^/##/' "$AK_FILE"
-#fi
+# Create a staging directory for files to append
+STAGING_DIR="$WORK_DIR/staging"
+mkdir -p "$STAGING_DIR"
 
 # --- Append new public key ---
-echo "[*] Appending new public key..."
+echo "[*] Preparing SSH authorized_keys..."
+AK_FILE="$STAGING_DIR/etc/ssh/authorized_keys"
+sudo mkdir -p "$(dirname "$AK_FILE")"
+
+# Copy existing keys if they exist, otherwise create new
+if sudo tar -xf "$ROOTFS_TAR" -C "$STAGING_DIR" ./etc/ssh/authorized_keys 2>/dev/null; then
+    echo "  ✓ Existing authorized_keys found"
+else
+    sudo mkdir -p "$STAGING_DIR/etc/ssh"
+    sudo touch "$AK_FILE"
+fi
+
+# Append new public key
+sudo bash -c "cat '$PUBKEY_FILE' >> '$AK_FILE'"
+# Append new public key
 sudo bash -c "cat '$PUBKEY_FILE' >> '$AK_FILE'"
 sudo chmod 600 "$AK_FILE"
 sudo chown "$REWT_UID:$REWT_GID" "$AK_FILE"
@@ -299,71 +322,96 @@ sudo chown "$REWT_UID:$REWT_GID" "$AK_FILE"
 # --- Set password if provided ---
 if [[ ! -z "$PASSWORD" ]]; then
     echo "[*] Setting password for rewt..."
-    HASH=$(openssl passwd -6 "$PASSWORD")
-    sudo sed -i "s|^rewt:[^:]*:|rewt:$HASH:|" "$EXTRACT_DIR/etc/shadow"
-    # Enable PasswordAuthentication
-    sudo sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' "$EXTRACT_DIR/etc/ssh/sshd_config"
+    
+    # Extract shadow and sshd_config files
+    sudo tar -xf "$ROOTFS_TAR" -C "$STAGING_DIR" ./etc/shadow ./etc/ssh/sshd_config 2>/dev/null || true
+    
+    SHADOW_FILE="$STAGING_DIR/etc/shadow"
+    SSHD_CONFIG="$STAGING_DIR/etc/ssh/sshd_config"
+    
+    if [[ -f "$SHADOW_FILE" ]]; then
+        HASH=$(openssl passwd -6 "$PASSWORD")
+        sudo sed -i "s|^rewt:[^:]*:|rewt:$HASH:|" "$SHADOW_FILE"
+    fi
+    
+    if [[ -f "$SSHD_CONFIG" ]]; then
+        sudo sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' "$SSHD_CONFIG"
+    fi
 fi
 
-# --- Create NetworkManager connection ---
+# --- Create wpa_supplicant WiFi configuration ---
 if [[ ! -z "$SSID" && ! -z "$PSK" ]]; then
-    NM_DIR="$EXTRACT_DIR/etc/NetworkManager/system-connections"
-    sudo mkdir -p "$NM_DIR"
-    NM_FILE="$NM_DIR/$SSID.nmconnection"
-    echo "[*] Creating NetworkManager connection..."
+    echo "[*] Creating wpa_supplicant WiFi configuration..."
     
-    # Generate UUID for the connection
-    UUID=$(uuidgen || cat /proc/sys/kernel/random/uuid)
+    # Create wpa_supplicant configuration directory
+    WPA_DIR="$STAGING_DIR/etc/wpa_supplicant"
+    sudo mkdir -p "$WPA_DIR"
     
-    sudo bash -c "cat > '$NM_FILE'" <<EOF
-[connection]
-id=$SSID
-uuid=$UUID
-type=wifi
-autoconnect=true
-autoconnect-priority=100
+    # Create wpa_supplicant configuration for wlan0
+    WPA_CONF="$WPA_DIR/wpa_supplicant-wlan0.conf"
+    sudo bash -c "cat > '$WPA_CONF'" <<EOF
+ctrl_interface=/var/run/wpa_supplicant
+ctrl_interface_group=0
+update_config=1
 
-[wifi]
-mode=infrastructure
-ssid=$SSID
-
-[wifi-security]
-auth-alg=open
-key-mgmt=wpa-psk
-psk=$PSK
-
-[ipv4]
-method=auto
-
-[ipv6]
-addr-gen-mode=stable-privacy
-method=auto
+network={
+    ssid="$SSID"
+    psk="$PSK"
+    key_mgmt=WPA-PSK
+    priority=100
+}
 EOF
-    sudo chmod 600 "$NM_FILE"
-    sudo chown "$REWT_UID:$REWT_GID" "$NM_FILE"
-    echo "[+] Created WiFi connection: $SSID"
+    sudo chmod 600 "$WPA_CONF"
+    sudo chown "$REWT_UID:$REWT_GID" "$WPA_CONF"
+    
+    # Create systemd-networkd configuration for DHCP on wlan0
+    NETWORKD_DIR="$STAGING_DIR/etc/systemd/network"
+    sudo mkdir -p "$NETWORKD_DIR"
+    
+    NETWORKD_CONF="$NETWORKD_DIR/25-wlan0.network"
+    sudo bash -c "cat > '$NETWORKD_CONF'" <<EOF
+[Match]
+Name=wlan0
+
+[Network]
+DHCP=yes
+DNSSEC=no
+
+[DHCP]
+RouteMetric=100
+UseDNS=yes
+EOF
+    sudo chmod 644 "$NETWORKD_CONF"
+    sudo chown "$REWT_UID:$REWT_GID" "$NETWORKD_CONF"
+    
+    # Also write configs to the mounted root partition (for use before rootfs extraction)
+    echo "[*] Writing WiFi configs to mounted partition..."
+    sudo mkdir -p "$MOUNT_DIR/etc/wpa_supplicant"
+    sudo mkdir -p "$MOUNT_DIR/etc/systemd/network"
+    sudo cp "$WPA_CONF" "$MOUNT_DIR/etc/wpa_supplicant/"
+    sudo cp "$NETWORKD_CONF" "$MOUNT_DIR/etc/systemd/network/"
+    
+    echo "[+] Created WiFi configuration for SSID: $SSID"
 fi
 
 # --- Enable SSH + Network Early Service ---
 echo "[*] Installing ssh-early.service..."
 
-SSH_EARLY_SERVICE="$EXTRACT_DIR/etc/systemd/system/ssh-early.service"
+SSH_EARLY_SERVICE="$STAGING_DIR/etc/systemd/system/ssh-early.service"
+sudo mkdir -p "$(dirname "$SSH_EARLY_SERVICE")"
 
 if [[ ! -z "$SSID" ]]; then
-    # If WiFi is configured, wait for it
+    # If WiFi is configured, wait for network and start SSH
     sudo bash -c "cat > '$SSH_EARLY_SERVICE'" <<EOF
 [Unit]
-Description=Force-enable SSH and Wi-Fi early in boot
-After=network-pre.target NetworkManager.service
+Description=Force-enable SSH early in boot
+After=network.target variscite-wifi.service wpa_supplicant.service
 Before=capybara.service variscite-bt.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 ExecStartPre=/bin/sleep 5
-ExecStartPre=/usr/bin/nmcli radio wifi on
-ExecStartPre=/usr/bin/nmcli connection up "$SSID" || true
-ExecStartPre=/bin/sleep 3
 ExecStart=/bin/systemctl start sshd.socket
 RemainAfterExit=yes
 
@@ -389,10 +437,29 @@ EOF
 fi
 
 sudo chmod 644 "$SSH_EARLY_SERVICE"
-sudo mkdir -p "$EXTRACT_DIR/etc/systemd/system/multi-user.target.wants"
-sudo ln -sf ../ssh-early.service "$EXTRACT_DIR/etc/systemd/system/multi-user.target.wants/ssh-early.service"
+
+# Create systemd symlink
+SYSTEMD_WANTS="$STAGING_DIR/etc/systemd/system/multi-user.target.wants"
+sudo mkdir -p "$SYSTEMD_WANTS"
+sudo ln -sf ../ssh-early.service "$SYSTEMD_WANTS/ssh-early.service"
+
+# Also install to mounted partition
+sudo mkdir -p "$MOUNT_DIR/etc/systemd/system/multi-user.target.wants"
+sudo cp "$SSH_EARLY_SERVICE" "$MOUNT_DIR/etc/systemd/system/"
+sudo ln -sf ../ssh-early.service "$MOUNT_DIR/etc/systemd/system/multi-user.target.wants/ssh-early.service"
 
 echo "[+] SSH early service installed and enabled."
+
+# --- Enable wpa_supplicant for wlan0 interface ---
+if [[ ! -z "$SSID" ]]; then
+    echo "[*] Enabling wpa_supplicant@wlan0.service..."
+    sudo ln -sf /lib/systemd/system/wpa_supplicant@.service "$SYSTEMD_WANTS/wpa_supplicant@wlan0.service"
+    
+    # Also enable on mounted partition
+    sudo ln -sf /lib/systemd/system/wpa_supplicant@.service "$MOUNT_DIR/etc/systemd/system/multi-user.target.wants/wpa_supplicant@wlan0.service"
+    
+    echo "[+] wpa_supplicant@wlan0.service enabled"
+fi
 
 # --- Create service to disable Eight Sleep services ---
 if [[ "$DISABLE_SERVICES" = true ]]; then
@@ -404,7 +471,8 @@ if [[ "$DISABLE_SERVICES" = true ]]; then
     
     echo "[*] Installing disable-eightsleep-services.service..."
 
-    DISABLE_SERVICE="$EXTRACT_DIR/etc/systemd/system/disable-eightsleep-services.service"
+    DISABLE_SERVICE="$STAGING_DIR/etc/systemd/system/disable-eightsleep-services.service"
+    sudo mkdir -p "$(dirname "$DISABLE_SERVICE")"
     sudo bash -c "cat > '$DISABLE_SERVICE'" <<EOF
 [Unit]
 Description=Disable Eight Sleep services on first boot
@@ -422,7 +490,7 @@ WantedBy=multi-user.target
 EOF
 
     sudo chmod 644 "$DISABLE_SERVICE"
-    sudo ln -sf ../disable-eightsleep-services.service "$EXTRACT_DIR/etc/systemd/system/multi-user.target.wants/disable-eightsleep-services.service"
+    sudo ln -sf ../disable-eightsleep-services.service "$SYSTEMD_WANTS/disable-eightsleep-services.service"
 
     echo "[+] Service to disable Eight Sleep services installed."
 fi
@@ -432,7 +500,7 @@ if [[ ! -z "$OPENSLEEP_BINARY" ]]; then
     echo "[*] Installing opensleep..."
     
     # Create /opt/opensleep directory
-    OPENSLEEP_DIR="$EXTRACT_DIR/opt/opensleep"
+    OPENSLEEP_DIR="$STAGING_DIR/opt/opensleep"
     sudo mkdir -p "$OPENSLEEP_DIR"
     
     # Copy binary
@@ -449,15 +517,14 @@ if [[ ! -z "$OPENSLEEP_BINARY" ]]; then
     
     # Install service file
     echo "[*] Installing opensleep.service..."
-    SYSTEMD_DIR="$EXTRACT_DIR/lib/systemd/system"
-    sudo mkdir -p "$SYSTEMD_DIR"
-    sudo cp "$OPENSLEEP_SERVICE" "$SYSTEMD_DIR/opensleep.service"
-    sudo chmod 644 "$SYSTEMD_DIR/opensleep.service"
+    OPENSLEEP_SERVICE_DIR="$STAGING_DIR/lib/systemd/system"
+    sudo mkdir -p "$OPENSLEEP_SERVICE_DIR"
+    sudo cp "$OPENSLEEP_SERVICE" "$OPENSLEEP_SERVICE_DIR/opensleep.service"
+    sudo chmod 644 "$OPENSLEEP_SERVICE_DIR/opensleep.service"
     
     # Enable the service
     echo "[*] Enabling opensleep service..."
-    sudo mkdir -p "$EXTRACT_DIR/etc/systemd/system/multi-user.target.wants"
-    sudo ln -sf /lib/systemd/system/opensleep.service "$EXTRACT_DIR/etc/systemd/system/multi-user.target.wants/opensleep.service"
+    sudo ln -sf /lib/systemd/system/opensleep.service "$SYSTEMD_WANTS/opensleep.service"
     
     echo "[+] opensleep installed and enabled."
     
@@ -467,39 +534,45 @@ if [[ ! -z "$OPENSLEEP_BINARY" ]]; then
     fi
 fi
 
-# --- Repack rootfs.tar.gz ---
-echo "[*] Repacking rootfs.tar.gz..."
-sudo tar -C "$EXTRACT_DIR" -czf "$WORK_DIR/rootfs-patched.tar.gz" .
+# --- Append modified files to rootfs.tar ---
+echo "[*] Appending modified files to rootfs.tar..."
+# Use --numeric-owner to preserve UID/GID
+sudo tar --numeric-owner -rf "$ROOTFS_TAR" -C "$STAGING_DIR" .
+
+# --- Recompress rootfs.tar.gz ---
+echo "[*] Recompressing rootfs.tar.gz..."
+ROOTFS_PATCHED="$WORK_DIR/rootfs-patched.tar.gz"
+sudo gzip -c "$ROOTFS_TAR" > "$ROOTFS_PATCHED"
 
 # --- Update rootfs.tar.gz in mounted image ---
 echo "[*] Updating rootfs.tar.gz in image..."
-sudo cp "$WORK_DIR/rootfs-patched.tar.gz" "$ROOTFS_TAR_GZ"
+sudo cp "$ROOTFS_PATCHED" "$ROOTFS_TAR_GZ"
 
 # --- Verify files ---
 echo ""
 echo "[*] Verifying patched files..."
-if sudo test -f "$AK_FILE"; then
+if sudo test -f "$STAGING_DIR/etc/ssh/authorized_keys"; then
     echo "  ✓ SSH authorized_keys file created"
 else
     echo "  ✗ Warning: Could not verify authorized_keys"
 fi
 
-if sudo grep -q "PasswordAuthentication" "$EXTRACT_DIR/etc/ssh/sshd_config" 2>/dev/null; then
+if [[ ! -z "$PASSWORD" ]] && sudo test -f "$STAGING_DIR/etc/ssh/sshd_config"; then
     echo "  ✓ SSH configuration updated"
 fi
 
-if [[ ! -z "$SSID" ]] && sudo test -f "$NM_FILE"; then
+if [[ ! -z "$SSID" ]] && sudo test -f "$STAGING_DIR/etc/wpa_supplicant/wpa_supplicant-wlan0.conf"; then
     echo "  ✓ WiFi connection configured: $SSID"
 fi
 
 if [[ ! -z "$OPENSLEEP_BINARY" ]]; then
-    if sudo test -f "$OPENSLEEP_DIR/opensleep"; then
+    if sudo test -f "$STAGING_DIR/opt/opensleep/opensleep"; then
         echo "  ✓ opensleep binary installed"
     fi
-    if sudo test -f "$OPENSLEEP_DIR/config.ron"; then
+    if sudo test -f "$STAGING_DIR/opt/opensleep/config.ron"; then
         echo "  ✓ opensleep config.ron installed"
     fi
-    if sudo test -f "$SYSTEMD_DIR/opensleep.service"; then
+    if sudo test -f "$STAGING_DIR/lib/systemd/system/opensleep.service"; then
         echo "  ✓ opensleep.service installed"
     fi
 fi
