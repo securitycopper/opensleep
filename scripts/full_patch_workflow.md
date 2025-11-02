@@ -1,4 +1,20 @@
-# Pod 3 Image Patching Script - Documentation
+# Pod 3 (SD Card) Image Patching Script - Documentation
+
+## ⚠️ Important: Pod 3 SD Card Version ONLY
+
+**This script is specifically designed for:**
+- Eight Sleep Pod 3 with **removable SD card**
+
+**This script does NOT work with:**
+- ❌ Pod 1 (no SD card, no SSH access)
+- ❌ Pod 2 (no SD card, no SSH access)
+- ❌ Pod 3 eMMC version (non-removable storage, requires different method)
+- ❌ Pod 4 (no SD card, see [free-sleep tutorial](https://github.com/throwaway31265/free-sleep))
+- ❌ Pod 5 (no SD card, see [free-sleep tutorial](https://github.com/throwaway31265/free-sleep))
+
+For Pod 3 without SD card or other Pod versions, see the [SETUP.md](../SETUP.md) file.
+
+---
 
 ## Overview
 
@@ -529,6 +545,10 @@ wifi_start() {
 -w WIFI_SSID          # WiFi network name
 -s WIFI_PASSWORD      # WiFi network password/passphrase
 
+# MAC Address Configuration
+-m MAC_ADDRESS        # Set persistent MAC address (format: AA:BB:CC:DD:EE:FF)
+                      # Prevents MAC from changing on factory reset
+
 # SSH Configuration  
 -P ROOT_PASSWORD      # Set password for 'rewt' user (enables password auth)
 
@@ -586,9 +606,14 @@ your system configuration.
 Run: ~/validate_deployment.sh
 Or:  ./validate_deployment.sh
 
+To skip this message in future sessions:
+  export VALIDATION_SHOWN=1
+
 # Run validation
 ./validate_deployment.sh
 ```
+
+**Note:** This validation is specific to Pod 3 with SD card. Other Pod versions have different configurations.
 
 See [Post-Patch Validation](#post-patch-validation) for details on what the script checks.
 
@@ -603,6 +628,17 @@ See [Post-Patch Validation](#post-patch-validation) for details on what the scri
     -s "MyPassword"
 ```
 → WiFi auto-connects, SSH accessible, Eight Sleep services still work
+
+**WiFi + SSH + Persistent MAC:**
+```bash
+./full_patch_workflow.sh \
+    -i pod3.img \
+    -k ~/.ssh/id_rsa.pub \
+    -w "MyNetwork" \
+    -s "MyPassword" \
+    -m "02:11:22:33:44:55"
+```
+→ WiFi auto-connects, MAC address stays the same after factory resets
 
 **WiFi + SSH + OpenSleep + Validation:**
 ```bash
@@ -661,6 +697,51 @@ See [Post-Patch Validation](#post-patch-validation) for details on what the scri
 
 **Masked:**
 - `/etc/systemd/system/variscite-wifi.service` → `/dev/null` - Prevent Eight Sleep WiFi from running
+
+### MAC Address Configuration (if `-m` provided)
+
+**Created:**
+- `/etc/systemd/system/opensleep-mac.service` - Service to set persistent MAC address
+- `/etc/systemd/system/network.target.wants/opensleep-mac.service` - Enable service
+
+**How it works:**
+- brcmfmac WiFi driver generates random MAC at firmware load time
+- systemd `.link` files don't work reliably with this driver
+- `opensleep-wifi.service` loads the brcmfmac driver (modprobe brcmfmac)
+- `opensleep-mac.service` runs **after** opensleep-wifi loads the driver
+- Service sets MAC using `ip link set dev wlan0 address <MAC>`
+- Runs **before** wpa_supplicant starts, so WiFi connects with correct MAC
+- Persists across reboots, updates, and **factory resets**
+
+**Service timing:**
+```
+opensleep-wifi.service
+  └─> modprobe brcmfmac (loads driver, random MAC generated)
+      └─> opensleep-mac.service
+          └─> ip link set wlan0 down
+          └─> ip link set wlan0 address <MAC>
+          └─> ip link set wlan0 up
+              └─> wpa_supplicant@wlan0.service (connects to WiFi with correct MAC)
+```
+
+**Why this approach:**
+- `.link` files are processed by udev, but brcmfmac sets MAC during firmware init
+- By the time udev processes the .link file, MAC is already set and can't be changed
+- opensleep-wifi reloads the driver (modprobe), which generates a new random MAC
+- We must set MAC **after** driver load but **before** wpa_supplicant starts
+- Using a service with proper ordering dependencies is the only reliable way
+
+**Why this matters:**
+- By default, Pod 3 generates a random MAC on each factory reset
+- This breaks MAC filtering/whitelisting on routers
+- With `-m` option, MAC stays the same forever
+- Useful for network security policies that require MAC whitelisting
+
+**Example use cases:**
+- Corporate/enterprise WiFi with MAC filtering
+- Home network with MAC whitelist for security
+- DHCP reservations based on MAC address
+- Network access control lists (ACLs)
 
 ### OpenSleep Installation (if `-b` provided)
 
@@ -823,16 +904,43 @@ ExecStart=/usr/bin/factory-reset.sh
 - This is why we use **dual-write strategy**
 
 **⚠️ Important: MAC Address Changes on Factory Reset**
-- The wlan0 MAC address is randomly generated on each factory reset
-- If you have MAC filtering on your router, you'll need to update the whitelist
+- **Without `-m` option:** The wlan0 MAC address is randomly generated on each factory reset
+- **With `-m` option:** MAC address stays the same (configured via systemd .link file)
+- If you have MAC filtering on your router, either:
+  - Use `-m` option to set a persistent MAC, OR
+  - Update your router's whitelist after each factory reset
 - The validation script displays the current MAC address
-- This is normal Eight Sleep behavior, not caused by our patching
+- Random MAC is normal Eight Sleep behavior (for privacy)
 
 **Button detection:**
 - Reads GPIO state from `/dev/input/event1` (bd718xx-pwrkey)
 - Button held = factory reset triggered
 - Button not held = normal boot continues
 - Visual feedback: LEDs blink during reset process
+
+**⚠️ IMPORTANT: Power Cycle Required After Factory Reset (Patched Images Only)**
+
+When using our **patched Pod 3 image**, after factory reset you MUST power cycle the device:
+
+1. **Hold reset button during power-on** (factory reset starts)
+2. **Wait for LED sequence:**
+   - Green blinking → Factory reset in progress
+   - **Yellow blinking → Factory reset complete**
+3. **⚠️ POWER OFF the device** (unplug power)
+4. **Wait 5-10 seconds**
+5. **Power ON the device** (plug power back in)
+6. **Device will now boot normally** with patched configuration
+
+**Why is this required?**
+- Factory reset extracts files but some services may be in inconsistent state
+- Power cycle ensures clean boot with all services starting correctly
+- This is specific to our patched image (opensleep-wifi, ssh-early, opensleep services)
+- **Not required for factory Eight Sleep images** (their reset process handles this)
+
+**What if I don't power cycle?**
+- Some services may not start correctly (WiFi, SSH, opensleep)
+- Device may appear to hang or not connect to WiFi
+- Simply power cycle to fix
 
 **Reset process (when button held):**
 ```bash
@@ -843,7 +951,7 @@ ExecStart=/usr/bin/factory-reset.sh
 if button_is_held; then
     echo "Factory reset triggered..."
     
-    # Blink LEDs for visual feedback
+    # Blink LEDs for visual feedback (green)
     blink_leds
     
     # Run Yocto eMMC recovery
@@ -852,6 +960,9 @@ if button_is_held; then
     # - Repartitions eMMC (if needed)
     # - Formats partitions
     # - Extracts rootfs.tar.gz over /
+    
+    # LED changes to yellow when complete
+    # ⚠️ USER MUST POWER CYCLE HERE (patched images only)
     
     # Reboot
     reboot
@@ -1169,6 +1280,12 @@ Script uses `--numeric-owner` in tar to preserve these IDs.
 - ✅ Checks network, services, files, and configuration
 - ✅ Survives factory reset (included in rootfs.tar.gz)
 
+**With persistent MAC (`-m`):**
+- ✅ MAC address configured via systemd .link file
+- ✅ MAC stays the same across reboots and factory resets
+- ✅ Useful for MAC filtering/whitelisting on routers
+- ✅ Prevents network access issues after factory reset
+
 ### Boot Time Expectations
 
 **First boot after patching:**
@@ -1195,7 +1312,7 @@ Script uses `--numeric-owner` in tar to preserve these IDs.
 
 ## Post-Patch Validation
 
-After successfully patching and booting the Pod 3, you can run a comprehensive validation script to verify everything is working correctly.
+After successfully patching and booting the Pod 3 (SD card version), you can run a comprehensive validation script to verify everything is working correctly.
 
 ### Running the Validation Script
 

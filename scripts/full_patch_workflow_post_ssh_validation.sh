@@ -1,13 +1,15 @@
 #!/bin/bash
 
-# Full Patch Deployment Validation Script
+# Pod 3 (SD Card) Post-Patch Validation Script
 # Run this on the Pod 3 after patching to validate the setup
-# Usage: ./full_patch_deployment_validation.sh
+# Usage: ./full_patch_workflow_post_ssh_validation.sh
+#
+# ⚠️  For Pod 3 with SD card only!
 
 set -e
 
 echo "========================================"
-echo "Pod 3 Patch Deployment Validation"
+echo "Pod 3 (SD Card) Patch Validation"
 echo "========================================"
 echo ""
 

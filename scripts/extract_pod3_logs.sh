@@ -2,8 +2,10 @@
 set -euo pipefail
 
 echo "======================================"
-echo "Pod 3 Log Extraction Script"
+echo "Pod 3 (SD Card) Log Extraction Script"
 echo "======================================"
+echo ""
+echo "⚠️  For Pod 3 with SD card only!"
 echo ""
 
 # Default values
@@ -14,6 +16,9 @@ OUTPUT_DIR=""
 usage() {
     cat <<EOF
 Usage: $0 -i IMAGE_FILE [-o OUTPUT_DIR]
+
+⚠️  Pod 3 (SD Card Version) ONLY
+   This script is designed for Eight Sleep Pod 3 with removable SD card.
 
 Required arguments:
   -i IMAGE_FILE    Path to the SD card image file

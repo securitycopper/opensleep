@@ -52,10 +52,8 @@ Optional arguments:
   -P PASSWORD      Password for the rewt user
   -m MAC_ADDRESS   Set persistent MAC address for wlan0 (format: AA:BB:CC:DD:EE:FF)
                    Prevents MAC from changing on factory reset
-  -R               Remove Eight Sleep SSH keys (keep only your key)
-                   WARNING: This prevents Eight Sleep remote access AND mobile app pairing.
-                   Recommended for privacy when using opensleep.
-                   Cannot restore Eight Sleep functionality without reflashing original image.
+  -R               [DISABLED] Remove Eight Sleep SSH keys (currently causes SSH connection failure)
+                   This feature is being debugged and will be re-enabled in a future update.
   -d               Disable Eight Sleep services on first boot
                    For saftey, it waits for a wifi connection before disabling, this ensures the pairing and reset options are not interfered with.
                    WARNING: This prevents normal Eight Sleep app pairing.
@@ -76,7 +74,7 @@ EOF
     exit 1
 }
 
-while getopts "i:k:o:w:s:p:P:b:S:c:v:m:Rdh" opt; do
+while getopts "i:k:o:w:s:p:P:b:S:c:v:m:dh" opt; do
     case $opt in
         i) IMG_FILE="$OPTARG" ;;
         k) PUBKEY_FILE="$OPTARG" ;;
@@ -90,7 +88,9 @@ while getopts "i:k:o:w:s:p:P:b:S:c:v:m:Rdh" opt; do
         c) OPENSLEEP_CONFIG="$OPTARG" ;;
         v) VALIDATION_SCRIPT="$OPTARG" ;;
         m) MAC_ADDRESS="$OPTARG" ;;
-        R) REMOVE_EIGHTSLEEP_KEYS=true ;;
+        R) echo "ERROR: -R flag is temporarily disabled due to SSH connection issues"
+           echo "This feature is being debugged and will be re-enabled in a future update"
+           exit 1 ;;
         d) DISABLE_SERVICES=true ;;
         h) usage ;;
         *) usage ;;
@@ -367,15 +367,14 @@ if [[ "$REMOVE_EIGHTSLEEP_KEYS" == true ]]; then
     echo "[*] Removing Eight Sleep SSH keys..."
     echo "[!] WARNING: This will prevent Eight Sleep mobile app pairing!"
     echo "[!] Eight Sleep remote access will be disabled"
-    # Create a temporary file with only the user's key
-    TEMP_AK="$WORK_DIR/authorized_keys.tmp"
-    sudo touch "$TEMP_AK"
     
-    # Add the new user key
-    sudo bash -c "cat '$PUBKEY_FILE' > '$TEMP_AK'"
+    # Create new authorized_keys with only the user's key
+    # Copy the user's public key
+    sudo cp "$PUBKEY_FILE" "$AK_FILE"
     
-    # Replace the authorized_keys file
-    sudo mv "$TEMP_AK" "$AK_FILE"
+    # Ensure file ends with newline (SSH keys should end with newline)
+    sudo bash -c "echo '' >> '$AK_FILE'"
+    
     echo "  ✓ Eight Sleep keys removed, only your key remains"
 else
     # Append new public key to existing keys
