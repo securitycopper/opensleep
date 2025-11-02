@@ -2,8 +2,12 @@
 set -euo pipefail
 
 echo "======================================"
-echo "OpenSleep Image Patching Script"
+echo "Pod 3 (SD Card) Image Patching Script"
 echo "======================================"
+echo ""
+echo "⚠️  IMPORTANT: This script is for Pod 3 with SD card only!"
+echo "   - Does NOT work with Pod 1, 2, 4, or 5"
+echo "   - Does NOT work with Pod 3 without SD card (eMMC version)"
 echo ""
 echo "Note: This script requires sudo privileges for:"
 echo "  - Mounting disk images (losetup, mount)"
@@ -24,11 +28,16 @@ OPENSLEEP_CONFIG=""
 OUTPUT_FILE=""
 WORK_DIR_CUSTOM=""
 VALIDATION_SCRIPT=""
+MAC_ADDRESS=""
 
 # Parse command-line arguments
 usage() {
     cat <<EOF
-Usage: $0 -i IMAGE_FILE -k PUBKEY_FILE [-o OUTPUT_FILE] [-w WORK_DIR] [-s SSID] [-p PSK] [-P PASSWORD] [-d] [-b BINARY] [-S SERVICE] [-c CONFIG] [-v VALIDATION_SCRIPT]
+Usage: $0 -i IMAGE_FILE -k PUBKEY_FILE [-o OUTPUT_FILE] [-w WORK_DIR] [-s SSID] [-p PSK] [-P PASSWORD] [-m MAC_ADDRESS] [-d] [-b BINARY] [-S SERVICE] [-c CONFIG] [-v VALIDATION_SCRIPT]
+
+⚠️  Pod 3 (SD Card Version) ONLY
+   This script is designed for Eight Sleep Pod 3 with removable SD card.
+   It does NOT work with Pod 1, 2, 4, 5, or Pod 3 eMMC (non-SD) versions.
 
 Required arguments:
   -i IMAGE_FILE    Path to the SD card image file
@@ -40,6 +49,8 @@ Optional arguments:
   -s SSID          WiFi network SSID
   -p PSK           WiFi network password/passphrase
   -P PASSWORD      Password for the rewt user
+  -m MAC_ADDRESS   Set persistent MAC address for wlan0 (format: AA:BB:CC:DD:EE:FF)
+                   Prevents MAC from changing on factory reset
   -d               Disable Eight Sleep services on first boot
                    For saftey, it waits for a wifi connection before disabling, this ensures the pairing and reset options are not interfered with.
                    WARNING: This prevents normal Eight Sleep app pairing.
@@ -54,11 +65,12 @@ Example:
   $0 -i sdcard.img -k ~/.ssh/id_rsa.pub -s "MyWiFi" -p "password123" -P "userpass" -d
   $0 -i sdcard.img -o sdcard-patched.img -w /mnt/bigdrive/temp -k ~/.ssh/id_rsa.pub -s "MyWiFi" -p "pass" -b ./opensleep -S ./opensleep.service -c ./config.ron -d
   $0 -i sdcard.img -k ~/.ssh/id_rsa.pub -s "MyWiFi" -p "pass" -v ./custom_validation.sh
+  $0 -i sdcard.img -k ~/.ssh/id_rsa.pub -s "MyWiFi" -p "pass" -m "02:11:22:33:44:55"
 EOF
     exit 1
 }
 
-while getopts "i:k:o:w:s:p:P:b:S:c:v:dh" opt; do
+while getopts "i:k:o:w:s:p:P:b:S:c:v:m:dh" opt; do
     case $opt in
         i) IMG_FILE="$OPTARG" ;;
         k) PUBKEY_FILE="$OPTARG" ;;
@@ -71,6 +83,7 @@ while getopts "i:k:o:w:s:p:P:b:S:c:v:dh" opt; do
         S) OPENSLEEP_SERVICE="$OPTARG" ;;
         c) OPENSLEEP_CONFIG="$OPTARG" ;;
         v) VALIDATION_SCRIPT="$OPTARG" ;;
+        m) MAC_ADDRESS="$OPTARG" ;;
         d) DISABLE_SERVICES=true ;;
         h) usage ;;
         *) usage ;;
@@ -135,6 +148,16 @@ elif [[ ! -f "$VALIDATION_SCRIPT" ]]; then
     exit 1
 else
     echo "  ✓ Validation script found: $VALIDATION_SCRIPT"
+fi
+
+# Validate MAC address format if provided
+if [[ ! -z "$MAC_ADDRESS" ]]; then
+    if [[ ! "$MAC_ADDRESS" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+        echo "Error: Invalid MAC address format: $MAC_ADDRESS"
+        echo "Expected format: AA:BB:CC:DD:EE:FF (e.g., 02:11:22:33:44:55)"
+        exit 1
+    fi
+    echo "  ✓ MAC address validated: $MAC_ADDRESS"
 fi
 
 echo ""
@@ -334,28 +357,90 @@ fi
 
 # Append new public key
 sudo bash -c "cat '$PUBKEY_FILE' >> '$AK_FILE'"
-# Append new public key
-sudo bash -c "cat '$PUBKEY_FILE' >> '$AK_FILE'"
 sudo chmod 600 "$AK_FILE"
 sudo chown "$REWT_UID:$REWT_GID" "$AK_FILE"
 
 # --- Set password if provided ---
 if [[ ! -z "$PASSWORD" ]]; then
     echo "[*] Setting password for rewt..."
+    echo "[!] WARNING: Password modification is experimental and may cause SSH issues"
+    echo "[!] If SSH stops working, re-patch without -P flag"
     
     # Extract shadow and sshd_config files
-    sudo tar -xf "$ROOTFS_TAR" -C "$STAGING_DIR" ./etc/shadow ./etc/ssh/sshd_config 2>/dev/null || true
-    
-    SHADOW_FILE="$STAGING_DIR/etc/shadow"
-    SSHD_CONFIG="$STAGING_DIR/etc/ssh/sshd_config"
-    
-    if [[ -f "$SHADOW_FILE" ]]; then
-        HASH=$(openssl passwd -6 "$PASSWORD")
-        sudo sed -i "s|^rewt:[^:]*:|rewt:$HASH:|" "$SHADOW_FILE"
-    fi
-    
-    if [[ -f "$SSHD_CONFIG" ]]; then
-        sudo sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' "$SSHD_CONFIG"
+    if ! sudo tar -xf "$ROOTFS_TAR" -C "$STAGING_DIR" ./etc/shadow ./etc/ssh/sshd_config 2>/dev/null; then
+        echo "[-] WARNING: Failed to extract /etc/shadow or /etc/ssh/sshd_config from tar"
+        echo "[-] Skipping password modification to avoid breaking SSH"
+        echo "[-] You can still use SSH key authentication"
+    else
+        SHADOW_FILE="$STAGING_DIR/etc/shadow"
+        SSHD_CONFIG="$STAGING_DIR/etc/ssh/sshd_config"
+        
+        PASSWORD_SET=false
+        
+        if [[ -f "$SHADOW_FILE" ]]; then
+            # Get original permissions and ownership before modification
+            SHADOW_PERMS=$(sudo stat -c "%a" "$SHADOW_FILE")
+            SHADOW_OWNER=$(sudo stat -c "%u:%g" "$SHADOW_FILE")
+            
+            echo "  [*] Original shadow file: perms=$SHADOW_PERMS owner=$SHADOW_OWNER"
+            
+            # Validate ownership - 0:0 usually means file was created by us, not extracted from tar
+            if [[ "$SHADOW_OWNER" == "0:0" ]]; then
+                echo "[-] WARNING: /etc/shadow has ownership 0:0, skipping password modification"
+                echo "[-] This prevents potential SSH corruption"
+            else
+                HASH=$(openssl passwd -6 "$PASSWORD")
+                sudo sed -i "s|^rewt:[^:]*:|rewt:$HASH:|" "$SHADOW_FILE"
+                
+                # Restore original permissions and ownership
+                sudo chmod "$SHADOW_PERMS" "$SHADOW_FILE"
+                sudo chown "$SHADOW_OWNER" "$SHADOW_FILE"
+                
+                # Also write to mounted partition for immediate use
+                sudo mkdir -p "$MOUNT_DIR/etc"
+                sudo cp "$SHADOW_FILE" "$MOUNT_DIR/etc/shadow"
+                sudo chmod "$SHADOW_PERMS" "$MOUNT_DIR/etc/shadow"
+                sudo chown "$SHADOW_OWNER" "$MOUNT_DIR/etc/shadow"
+                
+                PASSWORD_SET=true
+                echo "  ✓ Password set, permissions preserved"
+            fi
+        else
+            echo "[-] WARNING: /etc/shadow not found, skipping password modification"
+        fi
+        
+        if [[ -f "$SSHD_CONFIG" ]] && [[ "$PASSWORD_SET" = true ]]; then
+            # Get original permissions and ownership before modification
+            SSHD_PERMS=$(sudo stat -c "%a" "$SSHD_CONFIG")
+            SSHD_OWNER=$(sudo stat -c "%u:%g" "$SSHD_CONFIG")
+            
+            echo "  [*] Original sshd_config: perms=$SSHD_PERMS owner=$SSHD_OWNER"
+            
+            # Enable password authentication (handle both commented and uncommented lines)
+            sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' "$SSHD_CONFIG"
+            
+            # Restore original permissions and ownership
+            sudo chmod "$SSHD_PERMS" "$SSHD_CONFIG"
+            sudo chown "$SSHD_OWNER" "$SSHD_CONFIG"
+            
+            # Also write to mounted partition for immediate use
+            sudo mkdir -p "$MOUNT_DIR/etc/ssh"
+            sudo cp "$SSHD_CONFIG" "$MOUNT_DIR/etc/ssh/sshd_config"
+            sudo chmod "$SSHD_PERMS" "$MOUNT_DIR/etc/ssh/sshd_config"
+            sudo chown "$SSHD_OWNER" "$MOUNT_DIR/etc/ssh/sshd_config"
+            
+            echo "  ✓ Password authentication enabled, permissions preserved"
+        elif [[ "$PASSWORD_SET" = false ]]; then
+            echo "[-] Skipping sshd_config modification (password not set)"
+        else
+            echo "[-] WARNING: /etc/ssh/sshd_config not found, skipping modification"
+        fi
+        
+        if [[ "$PASSWORD_SET" = false ]]; then
+            echo ""
+            echo "[!] Password was NOT set due to errors"
+            echo "[!] SSH key authentication will still work"
+        fi
     fi
 fi
 
@@ -412,6 +497,10 @@ EOF
     sudo cp "$NETWORKD_CONF" "$MOUNT_DIR/etc/systemd/network/"
     
     echo "[+] Created WiFi configuration for SSID: $SSID"
+fi
+
+# --- WiFi initialization service (must be created before MAC service can reference it) ---
+if [[ ! -z "$SSID" ]]; then
     
     # --- Create opensleep-wifi service to initialize WiFi hardware ---
     echo "[*] Creating opensleep-wifi service..."
@@ -479,6 +568,52 @@ EOF
         echo "[!] WARNING: /etc/wifi/variscite-wifi not found in image"
         echo "    WiFi may not work without manual hardware initialization"
     fi
+    
+    # --- Configure persistent MAC address (requires opensleep-wifi service) ---
+    if [[ ! -z "$MAC_ADDRESS" ]]; then
+        echo "[*] Configuring persistent MAC address..."
+        
+        # brcmfmac WiFi driver generates random MAC at firmware load time
+        # .link files don't work reliably, so we use a service to set MAC after interface is up
+        
+        SYSTEMD_DIR="$STAGING_DIR/etc/systemd/system"
+        sudo mkdir -p "$SYSTEMD_DIR"
+        
+        # Create a service to set MAC address before networking starts
+        MAC_SERVICE="$SYSTEMD_DIR/opensleep-mac.service"
+        sudo bash -c "cat > '$MAC_SERVICE'" <<EOF
+[Unit]
+Description=OpenSleep Persistent MAC Address
+Before=network-pre.target wpa_supplicant@wlan0.service
+Wants=network-pre.target
+After=opensleep-wifi.service sys-subsystem-net-devices-wlan0.device
+BindsTo=sys-subsystem-net-devices-wlan0.device
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/ip link set dev wlan0 down
+ExecStart=/sbin/ip link set dev wlan0 address $MAC_ADDRESS
+ExecStart=/sbin/ip link set dev wlan0 up
+RemainAfterExit=yes
+
+[Install]
+WantedBy=network.target
+EOF
+        sudo chmod 644 "$MAC_SERVICE"
+        sudo chown 0:0 "$MAC_SERVICE"
+        
+        # Enable the service
+        sudo mkdir -p "$SYSTEMD_DIR/network.target.wants"
+        sudo ln -sf ../opensleep-mac.service "$SYSTEMD_DIR/network.target.wants/opensleep-mac.service"
+        
+        # Also write to mounted partition for immediate use
+        sudo mkdir -p "$MOUNT_DIR/etc/systemd/system/network.target.wants"
+        sudo cp "$MAC_SERVICE" "$MOUNT_DIR/etc/systemd/system/"
+        sudo ln -sf ../opensleep-mac.service "$MOUNT_DIR/etc/systemd/system/network.target.wants/opensleep-mac.service"
+        
+        echo "[+] MAC address set to: $MAC_ADDRESS"
+        echo "    MAC will persist across reboots and factory resets"
+    fi
 fi
 
 # --- Enable SSH + Network Early Service ---
@@ -545,11 +680,24 @@ if [[ ! -z "$SSID" ]]; then
     # Create wpa_supplicant service override to wait for opensleep-wifi
     WPA_OVERRIDE_DIR="$STAGING_DIR/etc/systemd/system/wpa_supplicant@wlan0.service.d"
     sudo mkdir -p "$WPA_OVERRIDE_DIR"
-    sudo bash -c "cat > '$WPA_OVERRIDE_DIR/override.conf'" <<'EOF'
+    
+    # Add MAC service dependency only if MAC address was configured
+    if [[ ! -z "$MAC_ADDRESS" ]]; then
+        sudo bash -c "cat > '$WPA_OVERRIDE_DIR/override.conf'" <<'EOF'
+[Unit]
+After=opensleep-wifi.service opensleep-mac.service
+Requires=opensleep-wifi.service
+EOF
+        echo "    ✓ wpa_supplicant will wait for opensleep-wifi and opensleep-mac"
+    else
+        sudo bash -c "cat > '$WPA_OVERRIDE_DIR/override.conf'" <<'EOF'
 [Unit]
 After=opensleep-wifi.service
 Requires=opensleep-wifi.service
 EOF
+        echo "    ✓ wpa_supplicant will wait for opensleep-wifi"
+    fi
+    
     sudo chmod 644 "$WPA_OVERRIDE_DIR/override.conf"
     
     # Enable wpa_supplicant@wlan0.service
@@ -694,7 +842,7 @@ if [[ ! -z "$VALIDATION_SCRIPT" ]]; then
     # Copy validation script to user's home directory
     sudo cp "$VALIDATION_SCRIPT" "$STAGING_DIR/home/rewt/validate_deployment.sh"
     sudo chmod +x "$STAGING_DIR/home/rewt/validate_deployment.sh"
-    sudo chown 0:0 "$STAGING_DIR/home/rewt/validate_deployment.sh"
+    sudo chown "$REWT_UID:$REWT_GID" "$STAGING_DIR/home/rewt/validate_deployment.sh"
     
     # Also copy to mounted partition for immediate use
     sudo mkdir -p "$MOUNT_DIR/home/rewt"
@@ -726,7 +874,7 @@ fi
 BASHRC_EOF
     
     sudo chmod 644 "$STAGING_DIR/home/rewt/.bashrc"
-    sudo chown 0:0 "$STAGING_DIR/home/rewt/.bashrc"
+    sudo chown "$REWT_UID:$REWT_GID" "$STAGING_DIR/home/rewt/.bashrc"
     
     # Copy .bashrc to mounted partition
     sudo cp "$STAGING_DIR/home/rewt/.bashrc" "$MOUNT_DIR/home/rewt/.bashrc"
@@ -737,6 +885,27 @@ fi
 
 # --- Append modified files to rootfs.tar ---
 echo "[*] Appending modified files to rootfs.tar..."
+
+# List of files that might already exist in the tar and need to be replaced
+# (tar --delete doesn't work on compressed archives, so we work with uncompressed tar)
+FILES_TO_REPLACE=(
+    "./etc/ssh/authorized_keys"
+)
+
+# Only delete shadow and sshd_config if we actually modified them (password was provided)
+if [[ ! -z "$PASSWORD" ]]; then
+    FILES_TO_REPLACE+=("./etc/shadow")
+    FILES_TO_REPLACE+=("./etc/ssh/sshd_config")
+fi
+
+# Delete old versions of files that we're replacing (if they exist)
+for file in "${FILES_TO_REPLACE[@]}"; do
+    if sudo tar -tf "$ROOTFS_TAR" "$file" >/dev/null 2>&1; then
+        echo "[*] Removing old $file from tar before updating..."
+        sudo tar --delete -f "$ROOTFS_TAR" "$file" 2>/dev/null || true
+    fi
+done
+
 # Use --numeric-owner to preserve UID/GID
 sudo tar --numeric-owner -rf "$ROOTFS_TAR" -C "$STAGING_DIR" .
 
@@ -766,6 +935,12 @@ if [[ ! -z "$SSID" ]] && sudo test -f "$STAGING_DIR/etc/wpa_supplicant/wpa_suppl
     echo "  ✓ WiFi connection configured: $SSID"
     if sudo test -f "$STAGING_DIR/etc/wifi/opensleep-wifi"; then
         echo "  ✓ opensleep-wifi service created (WiFi hardware initialization)"
+    fi
+fi
+
+if [[ ! -z "$MAC_ADDRESS" ]]; then
+    if sudo test -f "$STAGING_DIR/etc/systemd/system/opensleep-mac.service"; then
+        echo "  ✓ Persistent MAC address configured: $MAC_ADDRESS"
     fi
 fi
 
@@ -809,6 +984,15 @@ if [[ ! -z "$SSID" ]]; then
     echo "  - opensleep-wifi service will initialize WiFi hardware"
     echo "  - wpa_supplicant will connect automatically on boot"
     echo "  - variscite-wifi.service masked (EEPROM check bypassed)"
+fi
+
+if [[ ! -z "$MAC_ADDRESS" ]]; then
+    echo ""
+    echo "MAC Address Configuration:"
+    echo "  - Persistent MAC: $MAC_ADDRESS"
+    echo "  - Configured via systemd .link file"
+    echo "  - Will NOT change on factory reset"
+    echo "  - Survives reboots and system updates"
 fi
 
 if [[ ! -z "$OPENSLEEP_BINARY" ]]; then

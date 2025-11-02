@@ -197,6 +197,124 @@ After the Pod boots up:
 
 ---
 
+## Lessons Learned: MAC Address Configuration
+
+### Background
+
+Pod 3 uses the `brcmfmac` WiFi driver, which generates a **random MAC address** every time the firmware is loaded. This causes several issues:
+- MAC address changes on every boot
+- MAC address changes after factory reset
+- DHCP reservations don't work reliably
+- Network monitoring becomes difficult
+
+### What Doesn't Work
+
+❌ **systemd .link files** - The standard approach for setting persistent MAC addresses
+- The `brcmfmac` driver ignores `.link` file MAC settings
+- The driver loads at firmware initialization, before systemd-networkd processes `.link` files
+- MAC is already set by the time `.link` files are evaluated
+
+❌ **Running MAC service too early** - Before the driver is loaded
+- Services in `sysinit.target` run before the WiFi driver loads
+- Setting MAC before driver load results in "device not found" errors
+- Service would need to run as ExecStart in opensleep-wifi, but that's messy
+
+❌ **Hardcoded user/group IDs** - Using `0:0` for all files
+- Some files (like `/etc/shadow`) require specific ownership
+- Wrong ownership can corrupt authentication and break SSH completely
+- Must preserve original permissions and ownership from tar extraction
+
+### What Does Work
+
+✅ **systemd service running AFTER WiFi driver loads**
+
+The solution is a three-stage boot process:
+
+1. **opensleep-wifi.service** - Loads the brcmfmac driver
+   - Runs in `network.target` 
+   - Bypasses EEPROM check (Pod 3 reports WiFi unavailable)
+   - Initializes WiFi hardware with random MAC
+
+2. **opensleep-mac.service** - Sets persistent MAC address
+   - Runs `After=opensleep-wifi.service` (waits for driver)
+   - Uses `/sbin/ip link set` commands (not `/usr/sbin/ip`)
+   - Brings interface down, sets MAC, brings it back up
+   - Runs `Before=wpa_supplicant@wlan0.service`
+
+3. **wpa_supplicant@wlan0.service** - Connects to WiFi
+   - Runs after MAC is set
+   - Uses the configured persistent MAC address
+
+### Critical Implementation Details
+
+**Service Dependencies:**
+```ini
+[Unit]
+After=opensleep-wifi.service sys-subsystem-net-devices-wlan0.device
+Before=network-pre.target wpa_supplicant@wlan0.service
+BindsTo=sys-subsystem-net-devices-wlan0.device
+```
+
+**Correct IP Command Path:**
+- Use `/sbin/ip` (NOT `/usr/sbin/ip`)
+- Embedded systems have different PATH structures
+- Wrong path causes exit code 203/EXEC failure
+
+**Three-Step MAC Setting:**
+```bash
+ExecStart=/sbin/ip link set dev wlan0 down
+ExecStart=/sbin/ip link set dev wlan0 address $MAC_ADDRESS
+ExecStart=/sbin/ip link set dev wlan0 up
+```
+
+**File Permission Preservation:**
+- Always check original permissions: `stat -c "%a" file`
+- Always check original ownership: `stat -c "%u:%g" file`
+- Validate ownership before modification (error if `0:0` for shadow file)
+- Restore exact permissions after modification
+- Dual-write: staging directory for tar + mounted partition for immediate use
+
+### Debugging Tips
+
+**Check service status:**
+```bash
+systemctl status opensleep-wifi.service
+systemctl status opensleep-mac.service
+systemctl status wpa_supplicant@wlan0.service
+```
+
+**Verify MAC address:**
+```bash
+ip link show wlan0
+cat /sys/class/net/wlan0/address
+```
+
+**Check service timing:**
+```bash
+systemd-analyze critical-chain opensleep-mac.service
+```
+
+**View boot logs:**
+```bash
+journalctl -u opensleep-wifi.service
+journalctl -u opensleep-mac.service
+```
+
+### Factory Reset Behavior
+
+The persistent MAC configuration survives factory reset because:
+1. Service file is in `/etc/systemd/system/` (user space)
+2. Factory reset extracts `rootfs.tar.gz` which includes our service
+3. Tar duplicate prevention ensures latest version is used
+4. Service runs on every boot, reapplying MAC
+
+**Important:** After factory reset on patched images, you must **power cycle** (not just reboot):
+- Factory reset LED: Green (in progress) → Yellow (complete)
+- Power off the device when yellow LED shows
+- Power back on to boot with patched configuration
+
+---
+
 ## Additional Resources
 
 - [Main SETUP.md](../../../../SETUP.md) - General setup instructions
