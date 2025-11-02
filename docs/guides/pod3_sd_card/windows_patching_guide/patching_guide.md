@@ -226,9 +226,9 @@ Pod 3 uses the `brcmfmac` WiFi driver, which generates a **random MAC address** 
 
 ### What Does Work
 
-✅ **systemd service running AFTER WiFi driver loads**
+✅ **systemd service running AFTER WiFi driver loads + NetworkManager configuration**
 
-The solution is a three-stage boot process:
+The solution is a four-stage boot process:
 
 1. **opensleep-wifi.service** - Loads the brcmfmac driver
    - Runs in `network.target` 
@@ -241,8 +241,15 @@ The solution is a three-stage boot process:
    - Brings interface down, sets MAC, brings it back up
    - Runs `Before=wpa_supplicant@wlan0.service`
 
-3. **wpa_supplicant@wlan0.service** - Connects to WiFi
-   - Runs after MAC is set
+3. **NetworkManager** - Network management daemon
+   - Configured to NOT randomize MAC addresses
+   - Config: `/etc/NetworkManager/conf.d/99-disable-wifi-mac-randomization.conf`
+   - Uses `wifi.cloned-mac-address=permanent` (respects our set MAC)
+   - This was the missing piece - NetworkManager was overriding our MAC!
+
+4. **wpa_supplicant@wlan0.service** - Connects to WiFi
+   - Runs after both opensleep-wifi AND opensleep-mac complete
+   - Override config: `After=opensleep-wifi.service opensleep-mac.service`
    - Uses the configured persistent MAC address
 
 ### Critical Implementation Details
@@ -266,6 +273,24 @@ ExecStart=/sbin/ip link set dev wlan0 down
 ExecStart=/sbin/ip link set dev wlan0 address $MAC_ADDRESS
 ExecStart=/sbin/ip link set dev wlan0 up
 ```
+
+**NetworkManager Configuration (CRITICAL):**
+- NetworkManager can override manually set MAC addresses
+- Config file: `/etc/NetworkManager/conf.d/99-disable-wifi-mac-randomization.conf`
+- Settings:
+  ```ini
+  [device-mac-randomization]
+  wifi.scan-rand-mac-address=no
+  
+  [connection-mac-randomization]
+  wifi.cloned-mac-address=permanent
+  ```
+- Without this, NetworkManager will randomize the MAC after opensleep-mac sets it!
+
+**wpa_supplicant Override:**
+- Must wait for BOTH opensleep-wifi AND opensleep-mac
+- Override file: `/etc/systemd/system/wpa_supplicant@wlan0.service.d/override.conf`
+- Only add opensleep-mac dependency if MAC address was configured (conditional)
 
 **File Permission Preservation:**
 - Always check original permissions: `stat -c "%a" file`
