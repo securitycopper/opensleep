@@ -22,6 +22,7 @@ SSID=""
 PSK=""
 PASSWORD=""
 DISABLE_SERVICES=false
+REMOVE_EIGHTSLEEP_KEYS=false
 OPENSLEEP_BINARY=""
 OPENSLEEP_SERVICE=""
 OPENSLEEP_CONFIG=""
@@ -33,7 +34,7 @@ MAC_ADDRESS=""
 # Parse command-line arguments
 usage() {
     cat <<EOF
-Usage: $0 -i IMAGE_FILE -k PUBKEY_FILE [-o OUTPUT_FILE] [-w WORK_DIR] [-s SSID] [-p PSK] [-P PASSWORD] [-m MAC_ADDRESS] [-d] [-b BINARY] [-S SERVICE] [-c CONFIG] [-v VALIDATION_SCRIPT]
+Usage: $0 -i IMAGE_FILE -k PUBKEY_FILE [-o OUTPUT_FILE] [-w WORK_DIR] [-s SSID] [-p PSK] [-P PASSWORD] [-m MAC_ADDRESS] [-R] [-d] [-b BINARY] [-S SERVICE] [-c CONFIG] [-v VALIDATION_SCRIPT]
 
 ⚠️  Pod 3 (SD Card Version) ONLY
    This script is designed for Eight Sleep Pod 3 with removable SD card.
@@ -51,6 +52,10 @@ Optional arguments:
   -P PASSWORD      Password for the rewt user
   -m MAC_ADDRESS   Set persistent MAC address for wlan0 (format: AA:BB:CC:DD:EE:FF)
                    Prevents MAC from changing on factory reset
+  -R               Remove Eight Sleep SSH keys (keep only your key)
+                   WARNING: This prevents Eight Sleep remote access AND mobile app pairing.
+                   Recommended for privacy when using opensleep.
+                   Cannot restore Eight Sleep functionality without reflashing original image.
   -d               Disable Eight Sleep services on first boot
                    For saftey, it waits for a wifi connection before disabling, this ensures the pairing and reset options are not interfered with.
                    WARNING: This prevents normal Eight Sleep app pairing.
@@ -66,11 +71,12 @@ Example:
   $0 -i sdcard.img -o sdcard-patched.img -w /mnt/bigdrive/temp -k ~/.ssh/id_rsa.pub -s "MyWiFi" -p "pass" -b ./opensleep -S ./opensleep.service -c ./config.ron -d
   $0 -i sdcard.img -k ~/.ssh/id_rsa.pub -s "MyWiFi" -p "pass" -v ./custom_validation.sh
   $0 -i sdcard.img -k ~/.ssh/id_rsa.pub -s "MyWiFi" -p "pass" -m "02:11:22:33:44:55"
+  $0 -i sdcard.img -k ~/.ssh/id_rsa.pub -s "MyWiFi" -p "pass" -R -d
 EOF
     exit 1
 }
 
-while getopts "i:k:o:w:s:p:P:b:S:c:v:m:dh" opt; do
+while getopts "i:k:o:w:s:p:P:b:S:c:v:m:Rdh" opt; do
     case $opt in
         i) IMG_FILE="$OPTARG" ;;
         k) PUBKEY_FILE="$OPTARG" ;;
@@ -84,6 +90,7 @@ while getopts "i:k:o:w:s:p:P:b:S:c:v:m:dh" opt; do
         c) OPENSLEEP_CONFIG="$OPTARG" ;;
         v) VALIDATION_SCRIPT="$OPTARG" ;;
         m) MAC_ADDRESS="$OPTARG" ;;
+        R) REMOVE_EIGHTSLEEP_KEYS=true ;;
         d) DISABLE_SERVICES=true ;;
         h) usage ;;
         *) usage ;;
@@ -355,8 +362,27 @@ else
     sudo touch "$AK_FILE"
 fi
 
-# Append new public key
-sudo bash -c "cat '$PUBKEY_FILE' >> '$AK_FILE'"
+# Remove Eight Sleep keys if requested
+if [[ "$REMOVE_EIGHTSLEEP_KEYS" == true ]]; then
+    echo "[*] Removing Eight Sleep SSH keys..."
+    echo "[!] WARNING: This will prevent Eight Sleep mobile app pairing!"
+    echo "[!] Eight Sleep remote access will be disabled"
+    # Create a temporary file with only the user's key
+    TEMP_AK="$WORK_DIR/authorized_keys.tmp"
+    sudo touch "$TEMP_AK"
+    
+    # Add the new user key
+    sudo bash -c "cat '$PUBKEY_FILE' > '$TEMP_AK'"
+    
+    # Replace the authorized_keys file
+    sudo mv "$TEMP_AK" "$AK_FILE"
+    echo "  ✓ Eight Sleep keys removed, only your key remains"
+else
+    # Append new public key to existing keys
+    sudo bash -c "cat '$PUBKEY_FILE' >> '$AK_FILE'"
+    echo "  ✓ Your key appended to existing keys"
+fi
+
 sudo chmod 600 "$AK_FILE"
 sudo chown "$REWT_UID:$REWT_GID" "$AK_FILE"
 
