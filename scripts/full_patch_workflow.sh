@@ -384,10 +384,10 @@ if [[ ! -z "$PASSWORD" ]]; then
             
             echo "  [*] Original shadow file: perms=$SHADOW_PERMS owner=$SHADOW_OWNER"
             
-            # Validate ownership - 0:0 usually means file was created by us, not extracted from tar
-            if [[ "$SHADOW_OWNER" == "0:0" ]]; then
-                echo "[-] WARNING: /etc/shadow has ownership 0:0, skipping password modification"
-                echo "[-] This prevents potential SSH corruption"
+            # Validate file has content (check if rewt entry exists)
+            if ! sudo grep -q "^rewt:" "$SHADOW_FILE" 2>/dev/null; then
+                echo "[-] WARNING: /etc/shadow doesn't contain rewt entry, skipping password modification"
+                echo "[-] File may be empty or corrupted"
             else
                 HASH=$(openssl passwd -6 "$PASSWORD")
                 sudo sed -i "s|^rewt:[^:]*:|rewt:$HASH:|" "$SHADOW_FILE"
