@@ -23,11 +23,12 @@ OPENSLEEP_SERVICE=""
 OPENSLEEP_CONFIG=""
 OUTPUT_FILE=""
 WORK_DIR_CUSTOM=""
+VALIDATION_SCRIPT=""
 
 # Parse command-line arguments
 usage() {
     cat <<EOF
-Usage: $0 -i IMAGE_FILE -k PUBKEY_FILE [-o OUTPUT_FILE] [-w WORK_DIR] [-s SSID] [-p PSK] [-P PASSWORD] [-d] [-b BINARY] [-S SERVICE] [-c CONFIG]
+Usage: $0 -i IMAGE_FILE -k PUBKEY_FILE [-o OUTPUT_FILE] [-w WORK_DIR] [-s SSID] [-p PSK] [-P PASSWORD] [-d] [-b BINARY] [-S SERVICE] [-c CONFIG] [-v VALIDATION_SCRIPT]
 
 Required arguments:
   -i IMAGE_FILE    Path to the SD card image file
@@ -46,16 +47,18 @@ Optional arguments:
   -b BINARY        Path to opensleep binary to install
   -S SERVICE       Path to opensleep.service file to install
   -c CONFIG        Path to config.ron file to install
+  -v VALIDATION    Path to validation script to include in image (default: auto-detect in same directory)
   -h               Show this help message
 
 Example:
   $0 -i sdcard.img -k ~/.ssh/id_rsa.pub -s "MyWiFi" -p "password123" -P "userpass" -d
   $0 -i sdcard.img -o sdcard-patched.img -w /mnt/bigdrive/temp -k ~/.ssh/id_rsa.pub -s "MyWiFi" -p "pass" -b ./opensleep -S ./opensleep.service -c ./config.ron -d
+  $0 -i sdcard.img -k ~/.ssh/id_rsa.pub -s "MyWiFi" -p "pass" -v ./custom_validation.sh
 EOF
     exit 1
 }
 
-while getopts "i:k:o:w:s:p:P:b:S:c:dh" opt; do
+while getopts "i:k:o:w:s:p:P:b:S:c:v:dh" opt; do
     case $opt in
         i) IMG_FILE="$OPTARG" ;;
         k) PUBKEY_FILE="$OPTARG" ;;
@@ -67,6 +70,7 @@ while getopts "i:k:o:w:s:p:P:b:S:c:dh" opt; do
         b) OPENSLEEP_BINARY="$OPTARG" ;;
         S) OPENSLEEP_SERVICE="$OPTARG" ;;
         c) OPENSLEEP_CONFIG="$OPTARG" ;;
+        v) VALIDATION_SCRIPT="$OPTARG" ;;
         d) DISABLE_SERVICES=true ;;
         h) usage ;;
         *) usage ;;
@@ -116,6 +120,21 @@ if [[ ! -z "$OPENSLEEP_BINARY" ]]; then
     echo "  ✓ opensleep binary found: $OPENSLEEP_BINARY"
     echo "  ✓ opensleep.service found: $OPENSLEEP_SERVICE"
     echo "  ✓ config.ron found: $OPENSLEEP_CONFIG"
+fi
+
+# Auto-detect validation script if not specified
+if [[ -z "$VALIDATION_SCRIPT" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    AUTO_VALIDATION="$SCRIPT_DIR/full_patch_workflow_post_ssh_validation.sh"
+    if [[ -f "$AUTO_VALIDATION" ]]; then
+        VALIDATION_SCRIPT="$AUTO_VALIDATION"
+        echo "  ✓ Auto-detected validation script: $VALIDATION_SCRIPT"
+    fi
+elif [[ ! -f "$VALIDATION_SCRIPT" ]]; then
+    echo "Error: Validation script not found: $VALIDATION_SCRIPT"
+    exit 1
+else
+    echo "  ✓ Validation script found: $VALIDATION_SCRIPT"
 fi
 
 echo ""
@@ -393,6 +412,73 @@ EOF
     sudo cp "$NETWORKD_CONF" "$MOUNT_DIR/etc/systemd/network/"
     
     echo "[+] Created WiFi configuration for SSID: $SSID"
+    
+    # --- Create opensleep-wifi service to initialize WiFi hardware ---
+    echo "[*] Creating opensleep-wifi service..."
+    
+    # Check if variscite-wifi script exists on the mounted image
+    if sudo test -f "$MOUNT_DIR/etc/wifi/variscite-wifi"; then
+        # Create wifi directory in staging
+        sudo mkdir -p "$STAGING_DIR/etc/wifi"
+        
+        # Copy variscite-wifi script as opensleep-wifi
+        sudo cp "$MOUNT_DIR/etc/wifi/variscite-wifi" "$STAGING_DIR/etc/wifi/opensleep-wifi"
+        
+        # Bypass EEPROM check - modify wifi_is_available() function to always return 0
+        # This is necessary because Pod 3's EEPROM reports WiFi as unavailable even though hardware is present
+        sudo sed -i '/^wifi_is_available()/,/^}/{
+            /opt=.*i2cget/,/fi$/c\
+    # OpenSleep: Bypass EEPROM check - WiFi hardware is physically present\
+    # Eight Sleep EEPROM has WiFi bit unset but hardware exists\
+    return 0
+        }' "$STAGING_DIR/etc/wifi/opensleep-wifi"
+        
+        # Ensure script is executable
+        sudo chmod +x "$STAGING_DIR/etc/wifi/opensleep-wifi"
+        
+        # Create opensleep-wifi.service
+        sudo mkdir -p "$STAGING_DIR/etc/systemd/system"
+        OPENSLEEP_WIFI_SERVICE="$STAGING_DIR/etc/systemd/system/opensleep-wifi.service"
+        sudo bash -c "cat > '$OPENSLEEP_WIFI_SERVICE'" <<'EOF'
+[Unit]
+Description=OpenSleep WiFi Initialization Service
+Before=network.target
+After=sysinit.target
+ConditionPathExists=/etc/wifi/opensleep-wifi
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/etc/wifi/opensleep-wifi start
+ExecStop=/etc/wifi/opensleep-wifi stop
+
+[Install]
+WantedBy=network.target
+EOF
+        sudo chmod 644 "$OPENSLEEP_WIFI_SERVICE"
+        
+        # Enable opensleep-wifi.service (create symlink in network.target.wants)
+        sudo mkdir -p "$STAGING_DIR/etc/systemd/system/network.target.wants"
+        sudo ln -sf /etc/systemd/system/opensleep-wifi.service "$STAGING_DIR/etc/systemd/system/network.target.wants/opensleep-wifi.service"
+        
+        # Mask variscite-wifi.service to prevent conflicts
+        sudo ln -sf /dev/null "$STAGING_DIR/etc/systemd/system/variscite-wifi.service"
+        
+        # Also write to mounted partition for immediate use
+        sudo mkdir -p "$MOUNT_DIR/etc/wifi"
+        sudo cp "$STAGING_DIR/etc/wifi/opensleep-wifi" "$MOUNT_DIR/etc/wifi/"
+        sudo cp "$OPENSLEEP_WIFI_SERVICE" "$MOUNT_DIR/etc/systemd/system/"
+        sudo mkdir -p "$MOUNT_DIR/etc/systemd/system/network.target.wants"
+        sudo ln -sf /etc/systemd/system/opensleep-wifi.service "$MOUNT_DIR/etc/systemd/system/network.target.wants/opensleep-wifi.service"
+        sudo ln -sf /dev/null "$MOUNT_DIR/etc/systemd/system/variscite-wifi.service"
+        
+        echo "[+] opensleep-wifi service created and enabled"
+        echo "    ✓ WiFi hardware will be initialized on boot"
+        echo "    ✓ variscite-wifi.service masked (EEPROM check bypassed)"
+    else
+        echo "[!] WARNING: /etc/wifi/variscite-wifi not found in image"
+        echo "    WiFi may not work without manual hardware initialization"
+    fi
 fi
 
 # --- Enable SSH + Network Early Service ---
@@ -406,9 +492,10 @@ if [[ ! -z "$SSID" ]]; then
     sudo bash -c "cat > '$SSH_EARLY_SERVICE'" <<EOF
 [Unit]
 Description=Force-enable SSH early in boot
-After=network.target variscite-wifi.service wpa_supplicant.service
+After=network.target opensleep-wifi.service wpa_supplicant.service
 Before=capybara.service variscite-bt.service
 Wants=network-online.target
+Requires=opensleep-wifi.service
 
 [Service]
 Type=oneshot
@@ -454,12 +541,26 @@ echo "[+] SSH early service installed and enabled."
 # --- Enable wpa_supplicant for wlan0 interface ---
 if [[ ! -z "$SSID" ]]; then
     echo "[*] Enabling wpa_supplicant@wlan0.service..."
+    
+    # Create wpa_supplicant service override to wait for opensleep-wifi
+    WPA_OVERRIDE_DIR="$STAGING_DIR/etc/systemd/system/wpa_supplicant@wlan0.service.d"
+    sudo mkdir -p "$WPA_OVERRIDE_DIR"
+    sudo bash -c "cat > '$WPA_OVERRIDE_DIR/override.conf'" <<'EOF'
+[Unit]
+After=opensleep-wifi.service
+Requires=opensleep-wifi.service
+EOF
+    sudo chmod 644 "$WPA_OVERRIDE_DIR/override.conf"
+    
+    # Enable wpa_supplicant@wlan0.service
     sudo ln -sf /lib/systemd/system/wpa_supplicant@.service "$SYSTEMD_WANTS/wpa_supplicant@wlan0.service"
     
     # Also enable on mounted partition
+    sudo mkdir -p "$MOUNT_DIR/etc/systemd/system/wpa_supplicant@wlan0.service.d"
+    sudo cp "$WPA_OVERRIDE_DIR/override.conf" "$MOUNT_DIR/etc/systemd/system/wpa_supplicant@wlan0.service.d/"
     sudo ln -sf /lib/systemd/system/wpa_supplicant@.service "$MOUNT_DIR/etc/systemd/system/multi-user.target.wants/wpa_supplicant@wlan0.service"
     
-    echo "[+] wpa_supplicant@wlan0.service enabled"
+    echo "[+] wpa_supplicant@wlan0.service enabled with opensleep-wifi dependency"
 fi
 
 # --- Create service to disable Eight Sleep services ---
@@ -467,6 +568,27 @@ fi
 if [[ "$DISABLE_SERVICES" = true ]] || [[ ! -z "$OPENSLEEP_BINARY" ]]; then
     echo ""
     echo "⚠️  WARNING: Disabling Eight Sleep services ⚠️"
+    echo "This will prevent the Eight Sleep app from pairing with the Pod."
+    
+    # Warn if opensleep is being installed without WiFi configuration
+    if [[ -z "$SSID" ]]; then
+        echo ""
+        echo "⚠️⚠️⚠️  CRITICAL WARNING  ⚠️⚠️⚠️"
+        echo "Installing opensleep without WiFi credentials!"
+        echo "  - Pod 3 has no Ethernet port"
+        echo "  - Without WiFi, the device will have NO network connectivity"
+        echo "  - The device will be UNREACHABLE without serial console access"
+        echo ""
+        echo "Recommendation: Provide WiFi credentials with -s and -p flags"
+        echo ""
+        read -p "Continue anyway? (yes/no): " -r
+        if [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
+            echo "Aborting..."
+            cleanup
+            exit 1
+        fi
+    fi
+    
     echo "This will prevent the Eight Sleep app from pairing with the Pod."
     echo "To restore normal Eight Sleep functionality, you must reflash the original image."
     echo ""
@@ -562,6 +684,57 @@ if [[ ! -z "$OPENSLEEP_BINARY" ]]; then
     echo "[*] Eight Sleep services will be automatically disabled after opensleep starts."
 fi
 
+# --- Add validation script ---
+if [[ ! -z "$VALIDATION_SCRIPT" ]]; then
+    echo "[*] Adding validation script to image..."
+    
+    # Create home directory structure
+    sudo mkdir -p "$STAGING_DIR/home/rewt"
+    
+    # Copy validation script to user's home directory
+    sudo cp "$VALIDATION_SCRIPT" "$STAGING_DIR/home/rewt/validate_deployment.sh"
+    sudo chmod +x "$STAGING_DIR/home/rewt/validate_deployment.sh"
+    sudo chown 0:0 "$STAGING_DIR/home/rewt/validate_deployment.sh"
+    
+    # Also copy to mounted partition for immediate use
+    sudo mkdir -p "$MOUNT_DIR/home/rewt"
+    sudo cp "$VALIDATION_SCRIPT" "$MOUNT_DIR/home/rewt/validate_deployment.sh"
+    sudo chmod +x "$MOUNT_DIR/home/rewt/validate_deployment.sh"
+    
+    # Create .bashrc with welcome message
+    sudo tee "$STAGING_DIR/home/rewt/.bashrc" > /dev/null <<'BASHRC_EOF'
+# OpenSleep Pod 3 - Patched System
+
+# Show validation prompt on first interactive login
+if [ -f ~/validate_deployment.sh ] && [ -z "$VALIDATION_SHOWN" ]; then
+    export VALIDATION_SHOWN=1
+    echo ""
+    echo "=========================================="
+    echo "  OpenSleep Pod 3 - Welcome!"
+    echo "=========================================="
+    echo ""
+    echo "A validation script is available to verify"
+    echo "your system configuration."
+    echo ""
+    echo "Run: ~/validate_deployment.sh"
+    echo "Or:  ./validate_deployment.sh"
+    echo ""
+    echo "To skip this message in future sessions:"
+    echo "  export VALIDATION_SHOWN=1"
+    echo ""
+fi
+BASHRC_EOF
+    
+    sudo chmod 644 "$STAGING_DIR/home/rewt/.bashrc"
+    sudo chown 0:0 "$STAGING_DIR/home/rewt/.bashrc"
+    
+    # Copy .bashrc to mounted partition
+    sudo cp "$STAGING_DIR/home/rewt/.bashrc" "$MOUNT_DIR/home/rewt/.bashrc"
+    
+    echo "  ✓ Validation script added to /home/rewt/validate_deployment.sh"
+    echo "  ✓ Welcome banner configured (shows script location on first login)"
+fi
+
 # --- Append modified files to rootfs.tar ---
 echo "[*] Appending modified files to rootfs.tar..."
 # Use --numeric-owner to preserve UID/GID
@@ -591,6 +764,9 @@ fi
 
 if [[ ! -z "$SSID" ]] && sudo test -f "$STAGING_DIR/etc/wpa_supplicant/wpa_supplicant-wlan0.conf"; then
     echo "  ✓ WiFi connection configured: $SSID"
+    if sudo test -f "$STAGING_DIR/etc/wifi/opensleep-wifi"; then
+        echo "  ✓ opensleep-wifi service created (WiFi hardware initialization)"
+    fi
 fi
 
 if [[ ! -z "$OPENSLEEP_BINARY" ]]; then
@@ -605,6 +781,12 @@ if [[ ! -z "$OPENSLEEP_BINARY" ]]; then
     fi
 fi
 
+if [[ ! -z "$VALIDATION_SCRIPT" ]]; then
+    if sudo test -f "$STAGING_DIR/home/rewt/validate_deployment.sh"; then
+        echo "  ✓ Validation script included at /home/rewt/validate_deployment.sh"
+    fi
+fi
+
 ROOTFS_SIZE=$(sudo stat -c%s "$ROOTFS_TAR_GZ")
 ROOTFS_SIZE_MB=$((ROOTFS_SIZE / 1024 / 1024))
 echo "  ✓ Repacked rootfs.tar.gz: ${ROOTFS_SIZE_MB}MB"
@@ -616,6 +798,39 @@ sudo mv "$WORKING_IMG" "$OUTPUT_FILE"
 sudo chown $(id -u):$(id -g) "$OUTPUT_FILE"
 echo "[+] Patched image saved to: $OUTPUT_FILE"
 echo ""
+echo "======================================"
 echo "[+] Patch workflow complete!"
+echo "======================================"
+
+if [[ ! -z "$SSID" ]]; then
+    echo ""
+    echo "WiFi Configuration:"
+    echo "  - Network: $SSID"
+    echo "  - opensleep-wifi service will initialize WiFi hardware"
+    echo "  - wpa_supplicant will connect automatically on boot"
+    echo "  - variscite-wifi.service masked (EEPROM check bypassed)"
+fi
+
+if [[ ! -z "$OPENSLEEP_BINARY" ]]; then
+    echo ""
+    echo "OpenSleep Configuration:"
+    echo "  - opensleep binary installed to /opt/opensleep/"
+    echo "  - opensleep.service will start on boot"
+    echo "  - Eight Sleep services will be disabled after opensleep starts"
+    if [[ ! -z "$SSID" ]]; then
+        echo "  - Device will remain reachable via WiFi after Eight Sleep disabled"
+    fi
+fi
+
+if [[ ! -z "$VALIDATION_SCRIPT" ]]; then
+    echo ""
+    echo "Validation Script:"
+    echo "  - Script included at: /home/rewt/validate_deployment.sh"
+    echo "  - Welcome banner will show script location on first SSH login"
+    echo "  - Run with: ~/validate_deployment.sh or ./validate_deployment.sh"
+    echo "  - Validates network, services, and configuration"
+fi
+
+echo ""
 echo "[*] Flash patched SD card image and perform factory reset to apply changes."
 echo "[*] Original image preserved at: $IMG_FILE"
