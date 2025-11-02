@@ -122,6 +122,8 @@ Before patching, collect these files:
 - `-k` - SSH public key file (required)
 - `-s` - WiFi SSID (optional, but recommended)
 - `-p` - WiFi password (optional, but recommended)
+- `-m` - MAC address for wlan0 (optional, format: XX:XX:XX:XX:XX:XX)
+- `-P` - Password for rewt user (optional, enables password authentication)
 - `-b` - opensleep binary (optional)
 - `-S` - opensleep.service file (optional)
 - `-c` - config.ron file (optional)
@@ -129,6 +131,12 @@ Before patching, collect these files:
 
 **⚠️ Note about `-d` flag:**
 Using `-d` disables Eight Sleep services and prevents normal Eight Sleep app pairing. To restore Eight Sleep functionality, you must reflash the original image.
+
+**📝 Note about `-P` flag:**
+Using `-P` enables password authentication for the `rewt` user. The password will persist across factory resets. This is useful if you want both SSH key and password authentication available.
+
+**📝 Note about `-m` flag:**
+Setting a MAC address helps with router/firewall MAC filtering. The MAC address will persist across factory resets, but **WILL CHANGE** after each factory reset if not set (due to the Broadcom WiFi driver generating a random MAC).
 
 The script will create a patched image named `pod3_original-patched.img` in the same directory as the input image.
 
@@ -158,20 +166,47 @@ The script will create a patched image named `pod3_original-patched.img` in the 
 
 After the Pod boots up:
 
-1. **SSH Access:**
+1. **SSH Access (with key):**
    ```bash
    ssh rewt@<pod-ip-address> -p 8822
    ```
+
+2. **SSH Access (with password, if -P was used):**
+   ```bash
+   ssh rewt@<pod-ip-address> -p 8822
+   # Enter password when prompted
+   ```
    
-2. **Check opensleep status** (if installed):
+3. **Check opensleep status** (if installed):
    ```bash
    systemctl status opensleep
    ```
 
-3. **Check WiFi connection:**
+4. **Check WiFi connection:**
    ```bash
    nmcli connection show
    ```
+
+5. **Check MAC address** (if -m was used):
+   ```bash
+   ip addr show wlan0 | grep ether
+   ```
+
+---
+
+## Tested Features
+
+The following features have been tested and confirmed working:
+
+✅ **SSH Key Authentication** - Tested and working  
+✅ **WiFi Auto-Connect** - Tested and working  
+✅ **MAC Address Persistence** - Tested and working (survives factory reset)  
+✅ **Password Authentication** - Tested and working (survives factory reset)  
+✅ **Eight Sleep Service Disabling** - Tested and working  
+✅ **opensleep Service** - Tested and working  
+✅ **Factory Reset Survival** - All configurations persist after factory reset + power cycle  
+
+**Note:** Password authentication (`-P` flag) was tested on November 2, 2025 and confirmed to work correctly. The validation bug that was rejecting legitimate root-owned shadow files has been fixed.
 
 ---
 
