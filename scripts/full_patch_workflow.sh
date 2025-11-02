@@ -40,6 +40,7 @@ Optional arguments:
   -p PSK           WiFi network password/passphrase
   -P PASSWORD      Password for the rewt user
   -d               Disable Eight Sleep services on first boot
+                   For saftey, it waits for a wifi connection before disabling, this ensures the pairing and reset options are not interfered with.
                    WARNING: This prevents normal Eight Sleep app pairing.
                    To restore Eight Sleep functionality, you must reflash the original image.
   -b BINARY        Path to opensleep binary to install
@@ -462,7 +463,8 @@ if [[ ! -z "$SSID" ]]; then
 fi
 
 # --- Create service to disable Eight Sleep services ---
-if [[ "$DISABLE_SERVICES" = true ]]; then
+# Auto-enable if opensleep is being installed
+if [[ "$DISABLE_SERVICES" = true ]] || [[ ! -z "$OPENSLEEP_BINARY" ]]; then
     echo ""
     echo "⚠️  WARNING: Disabling Eight Sleep services ⚠️"
     echo "This will prevent the Eight Sleep app from pairing with the Pod."
@@ -473,10 +475,35 @@ if [[ "$DISABLE_SERVICES" = true ]]; then
 
     DISABLE_SERVICE="$STAGING_DIR/etc/systemd/system/disable-eightsleep-services.service"
     sudo mkdir -p "$(dirname "$DISABLE_SERVICE")"
-    sudo bash -c "cat > '$DISABLE_SERVICE'" <<EOF
+    
+    if [[ ! -z "$OPENSLEEP_BINARY" ]]; then
+        # If opensleep is installed, wait for it to be running before disabling Eight Sleep services
+        sudo bash -c "cat > '$DISABLE_SERVICE'" <<EOF
+[Unit]
+Description=Disable Eight Sleep services after opensleep starts
+After=multi-user.target opensleep.service
+Wants=network-online.target
+ConditionPathExists=!/var/lib/eightsleep-disabled.flag
+
+[Service]
+Type=oneshot
+# Wait for opensleep to be fully running (max 60 seconds)
+ExecStartPre=/bin/sh -c 'for i in \$(seq 1 60); do systemctl is-active opensleep.service && break || sleep 1; done'
+# Disable Eight Sleep services
+ExecStart=/bin/systemctl disable --now dac frank capybara swupdate-progress swupdate defibrillator
+ExecStartPost=/bin/touch /var/lib/eightsleep-disabled.flag
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    else
+        # Without opensleep, just wait for network
+        sudo bash -c "cat > '$DISABLE_SERVICE'" <<EOF
 [Unit]
 Description=Disable Eight Sleep services on first boot
-After=multi-user.target
+After=multi-user.target network-online.target
+Wants=network-online.target
 ConditionPathExists=!/var/lib/eightsleep-disabled.flag
 
 [Service]
@@ -488,11 +515,16 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
+    fi
 
     sudo chmod 644 "$DISABLE_SERVICE"
     sudo ln -sf ../disable-eightsleep-services.service "$SYSTEMD_WANTS/disable-eightsleep-services.service"
 
-    echo "[+] Service to disable Eight Sleep services installed."
+    if [[ ! -z "$OPENSLEEP_BINARY" ]]; then
+        echo "[+] Service to disable Eight Sleep services installed (waits for opensleep)."
+    else
+        echo "[+] Service to disable Eight Sleep services installed."
+    fi
 fi
 
 # --- Install opensleep if provided ---
@@ -527,11 +559,7 @@ if [[ ! -z "$OPENSLEEP_BINARY" ]]; then
     sudo ln -sf /lib/systemd/system/opensleep.service "$SYSTEMD_WANTS/opensleep.service"
     
     echo "[+] opensleep installed and enabled."
-    
-    # Automatically enable service disabling if opensleep is installed
-    if [[ "$DISABLE_SERVICES" = false ]]; then
-        echo "[*] Note: Consider using -d flag to disable Eight Sleep services when using opensleep"
-    fi
+    echo "[*] Eight Sleep services will be automatically disabled after opensleep starts."
 fi
 
 # --- Append modified files to rootfs.tar ---

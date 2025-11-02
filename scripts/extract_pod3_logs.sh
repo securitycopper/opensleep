@@ -143,6 +143,34 @@ JOURNAL_DIR="$MOUNT_DIR/var/log/journal"
 if sudo test -d "$JOURNAL_DIR"; then
     sudo cp -r "$JOURNAL_DIR" "$OUTPUT_DIR/journal" 2>/dev/null || true
     echo "  ✓ Journal logs extracted"
+    
+    # Attempt to decode journal logs with journalctl
+    echo "[*] Decoding journal logs..."
+    if command -v journalctl &> /dev/null; then
+        # Full boot log
+        sudo journalctl --directory="$OUTPUT_DIR/journal" --no-pager > "$OUTPUT_DIR/journal/decoded_full.log" 2>/dev/null || true
+        
+        # Service-specific logs
+        sudo journalctl --directory="$OUTPUT_DIR/journal" --no-pager -u variscite-wifi.service > "$OUTPUT_DIR/journal/variscite-wifi.log" 2>/dev/null || true
+        sudo journalctl --directory="$OUTPUT_DIR/journal" --no-pager -u wpa_supplicant@wlan0.service > "$OUTPUT_DIR/journal/wpa_supplicant.log" 2>/dev/null || true
+        sudo journalctl --directory="$OUTPUT_DIR/journal" --no-pager -u ssh-early.service > "$OUTPUT_DIR/journal/ssh-early.log" 2>/dev/null || true
+        sudo journalctl --directory="$OUTPUT_DIR/journal" --no-pager -u systemd-networkd.service > "$OUTPUT_DIR/journal/systemd-networkd.log" 2>/dev/null || true
+        sudo journalctl --directory="$OUTPUT_DIR/journal" --no-pager -u opensleep.service > "$OUTPUT_DIR/journal/opensleep.log" 2>/dev/null || true
+        
+        # Boot messages
+        sudo journalctl --directory="$OUTPUT_DIR/journal" --no-pager -b > "$OUTPUT_DIR/journal/decoded_boot.log" 2>/dev/null || true
+        
+        # Kernel messages
+        sudo journalctl --directory="$OUTPUT_DIR/journal" --no-pager -k > "$OUTPUT_DIR/journal/decoded_kernel.log" 2>/dev/null || true
+        
+        # Priority: errors and warnings
+        sudo journalctl --directory="$OUTPUT_DIR/journal" --no-pager -p err > "$OUTPUT_DIR/journal/decoded_errors.log" 2>/dev/null || true
+        sudo journalctl --directory="$OUTPUT_DIR/journal" --no-pager -p warning > "$OUTPUT_DIR/journal/decoded_warnings.log" 2>/dev/null || true
+        
+        echo "  ✓ Journal logs decoded"
+    else
+        echo "  ⚠ journalctl not found - install systemd to decode journal logs"
+    fi
 else
     echo "  ℹ No persistent journal logs found"
 fi
@@ -269,6 +297,9 @@ fi
 if sudo test -f "$MOUNT_DIR/etc/ssh/authorized_keys"; then
     sudo cp "$MOUNT_DIR/etc/ssh/authorized_keys" "$OUTPUT_DIR/ssh/" 2>/dev/null || true
 fi
+if sudo test -f "$MOUNT_DIR/home/rewt/.ssh/authorized_keys"; then
+    sudo cp "$MOUNT_DIR/home/rewt/.ssh/authorized_keys" "$OUTPUT_DIR/ssh/rewt_authorized_keys" 2>/dev/null || true
+fi
 echo "  ✓ SSH config extracted"
 
 # --- Extract network configuration ---
@@ -297,11 +328,19 @@ fi
 # wpa_supplicant
 if sudo test -d "$MOUNT_DIR/etc/wpa_supplicant"; then
     sudo cp -r "$MOUNT_DIR/etc/wpa_supplicant" "$OUTPUT_DIR/network/" 2>/dev/null || true
+    # List all wpa_supplicant config files for debugging
+    sudo ls -la "$MOUNT_DIR/etc/wpa_supplicant/" > "$OUTPUT_DIR/network/wpa_supplicant_files.txt" 2>/dev/null || true
 fi
 
 # iwd (alternative to wpa_supplicant)
 if sudo test -d "$MOUNT_DIR/var/lib/iwd"; then
     sudo cp -r "$MOUNT_DIR/var/lib/iwd" "$OUTPUT_DIR/network/" 2>/dev/null || true
+fi
+
+# Check for active network interfaces
+echo "Network Interface Information:" > "$OUTPUT_DIR/network/interface_info.txt" 2>/dev/null || true
+if sudo test -f "$MOUNT_DIR/sys/class/net/wlan0/address"; then
+    echo "wlan0 MAC: $(sudo cat $MOUNT_DIR/sys/class/net/wlan0/address 2>/dev/null || echo 'N/A')" >> "$OUTPUT_DIR/network/interface_info.txt"
 fi
 
 echo "  ✓ Network config extracted"
@@ -346,6 +385,15 @@ if sudo test -d "$MOUNT_DIR/etc/init.d"; then
     sudo find "$MOUNT_DIR/etc/init.d" -name "*network*" -o -name "*wifi*" 2>/dev/null | while read script; do
         sudo cp "$script" "$OUTPUT_DIR/eightsleep/" 2>/dev/null || true
     done
+fi
+
+# Extract variscite-wifi script (important for WiFi setup)
+if sudo test -d "$MOUNT_DIR/etc/wifi"; then
+    sudo ls -la "$MOUNT_DIR/etc/wifi" > "$OUTPUT_DIR/eightsleep/etc_wifi_contents.txt" 2>/dev/null || true
+    if sudo test -f "$MOUNT_DIR/etc/wifi/variscite-wifi"; then
+        sudo cp "$MOUNT_DIR/etc/wifi/variscite-wifi" "$OUTPUT_DIR/eightsleep/" 2>/dev/null || true
+        echo "  ✓ variscite-wifi script extracted"
+    fi
 fi
 
 echo "  ✓ Eight Sleep config extracted"
@@ -408,6 +456,16 @@ Files Extracted:
 
 Network Management Tools Found:
 $(cat "$OUTPUT_DIR/packages/network_tools.txt" 2>/dev/null || echo "N/A")
+
+WiFi Configuration Files Found:
+$(if sudo test -f "$MOUNT_DIR/etc/wpa_supplicant/wpa_supplicant-wlan0.conf"; then echo "  ✓ wpa_supplicant-wlan0.conf"; fi)
+$(if sudo test -f "$MOUNT_DIR/etc/systemd/network/25-wlan0.network"; then echo "  ✓ 25-wlan0.network"; fi)
+$(if sudo test -f "$MOUNT_DIR/etc/wifi/variscite-wifi"; then echo "  ✓ variscite-wifi script"; fi)
+
+Custom Services Found:
+$(if sudo test -f "$MOUNT_DIR/etc/systemd/system/ssh-early.service"; then echo "  ✓ ssh-early.service"; fi)
+$(if sudo test -f "$MOUNT_DIR/etc/systemd/system/disable-eightsleep-services.service"; then echo "  ✓ disable-eightsleep-services.service"; fi)
+$(if sudo test -L "$MOUNT_DIR/etc/systemd/system/multi-user.target.wants/wpa_supplicant@wlan0.service"; then echo "  ✓ wpa_supplicant@wlan0.service (enabled)"; fi)
 
 EOF
 
